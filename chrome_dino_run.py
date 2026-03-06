@@ -166,8 +166,10 @@ class TRexRunner:
         self.episodes = 10000
         self.eval_freq = 25  # Run eval episode every N training episodes
         self.eval_runs = 5   # Average over N eval episodes for reliability
-        self.env = DinoRunEnv()
-        self.eval_env = DinoRunEnv()
+        # Training env uses domain randomization + feature noise
+        self.env = DinoRunEnv(domain_randomization=True, feature_noise=0.02)
+        # Eval env uses no randomization for consistent benchmarking
+        self.eval_env = DinoRunEnv(domain_randomization=False, feature_noise=0.0)
         self.action_size = self.env.action_space.n
         self.agent = Agent(self.action_size)
 
@@ -199,7 +201,7 @@ class TRexRunner:
         try:
             for e in range(self.episodes):
                 self.env.reset()
-                state = self.env.get_features()
+                state = self.env.get_features(add_noise=True)
 
                 game_score = 0
 
@@ -213,7 +215,7 @@ class TRexRunner:
                     if done:
                         reward = -10.0
 
-                    next_state = self.env.get_features()
+                    next_state = self.env.get_features(add_noise=True)
 
                     self.agent.remember(state, action, reward, next_state, done)
 

@@ -5,6 +5,12 @@ that produces observations similar to Canny edge detection output.
 
 Faithfully models the real game's acceleration: speed starts at 6 and
 ramps up to 13 over ~7000 frames, with obstacle gaps scaling accordingly.
+
+Domain randomization features (for sim-to-real transfer):
+- Pterodactyls: ~20% chance instead of cactus (low or high)
+- Obstacle clusters: ~25% chance of 2-3 cacti spawned close together
+- Randomized DINO_X: [20, 55] per episode (real Chrome game uses ~24)
+- Small Gaussian noise on features during training
 """
 import numpy as np
 import cv2
@@ -41,7 +47,6 @@ class DinoRunEnv:
     GROUND_Y = 130
 
     # Dinosaur (matches real Chrome dino game physics)
-    DINO_X = 50
     DINO_WIDTH = 44
     DINO_HEIGHT = 47
     DINO_HITBOX_MARGIN = 4
@@ -61,20 +66,33 @@ class DinoRunEnv:
     CROP_WIDTH = 300
     OBS_SIZE = 80
 
-    def __init__(self):
+    # Pterodactyl dimensions (matching real Chrome game)
+    PTERO_WIDTH = 46
+    PTERO_HEIGHT = 40
+
+    def __init__(self, domain_randomization=True, feature_noise=0.02):
         self.action_space = ActionSpace(2)
         self.reward_range = (-1, 0.1)
+        self.domain_randomization = domain_randomization
+        self.feature_noise = feature_noise
+        self.dino_x = 50  # Will be randomized on reset if DR enabled
         self.dino_y = 0.0
         self.dino_vel_y = 0.0
         self.is_jumping = False
         self.score = 0
         self.distance = 0.0
         self.crashed = False
-        self.obstacles = []
+        self.obstacles = []  # Each: [x, width, height, obs_type, obs_y]
         self.speed = self.INITIAL_SPEED
 
     def reset(self):
         """Reset game and return initial observation."""
+        # Randomize DINO_X for sim-to-real transfer
+        if self.domain_randomization:
+            self.dino_x = np.random.randint(20, 56)  # [20, 55]
+        else:
+            self.dino_x = 50
+
         self.dino_y = float(self.GROUND_Y - self.DINO_HEIGHT)
         self.dino_vel_y = 0.0
         self.is_jumping = False
@@ -89,7 +107,7 @@ class DinoRunEnv:
         return self._get_observation()
 
     def _spawn_obstacle(self, x=None):
-        """Spawn a new cactus obstacle with speed-scaled gap."""
+        """Spawn a new obstacle: cactus, pterodactyl, or cluster."""
         if x is None:
             if self.obstacles:
                 last_x = max(obs[0] for obs in self.obstacles)
@@ -102,15 +120,53 @@ class DinoRunEnv:
             else:
                 x = self.GAME_WIDTH + 50
 
-        # Random obstacle size (small or large cactus)
+        if self.domain_randomization and np.random.random() < 0.20:
+            # Pterodactyl (~20% chance)
+            self._spawn_pterodactyl(x)
+        elif self.domain_randomization and np.random.random() < 0.25:
+            # Obstacle cluster (~25% of remaining 80% = ~20% overall)
+            self._spawn_cluster(x)
+        else:
+            # Single cactus
+            self._spawn_cactus(x)
+
+    def _spawn_cactus(self, x):
+        """Spawn a single cactus obstacle."""
         if np.random.random() < 0.5:
             width = np.random.randint(17, 35)
             height = 35
         else:
             width = np.random.randint(25, 51)
             height = 50
+        obs_y = self.GROUND_Y - height  # Sits on ground
+        self.obstacles.append([float(x), width, height, 'cactus', obs_y])
 
-        self.obstacles.append([float(x), width, height])
+    def _spawn_pterodactyl(self, x):
+        """Spawn a pterodactyl at low or high altitude."""
+        width = self.PTERO_WIDTH
+        height = self.PTERO_HEIGHT
+        if np.random.random() < 0.5:
+            # Low pterodactyl: at ground level, must jump over
+            obs_y = self.GROUND_Y - height
+        else:
+            # High pterodactyl: above dino's head, can run under
+            obs_y = self.GROUND_Y - self.DINO_HEIGHT - height - 10
+        self.obstacles.append([float(x), width, height, 'ptero', obs_y])
+
+    def _spawn_cluster(self, x):
+        """Spawn 2-3 cacti close together as a cluster."""
+        n_cacti = np.random.randint(2, 4)  # 2 or 3
+        cx = x
+        for _ in range(n_cacti):
+            if np.random.random() < 0.5:
+                width = np.random.randint(17, 35)
+                height = 35
+            else:
+                width = np.random.randint(25, 51)
+                height = 50
+            obs_y = self.GROUND_Y - height
+            self.obstacles.append([float(cx), width, height, 'cactus', obs_y])
+            cx += width + np.random.randint(40, 81)  # Small gap between cluster members
 
     def step(self, action):
         """
@@ -157,16 +213,16 @@ class DinoRunEnv:
 
         # Check collision with forgiving hitbox
         m = self.DINO_HITBOX_MARGIN
-        dino_left = self.DINO_X + m
+        dino_left = self.dino_x + m
         dino_top = int(self.dino_y) + m
-        dino_right = self.DINO_X + self.DINO_WIDTH - m
+        dino_right = self.dino_x + self.DINO_WIDTH - m
         dino_bottom = int(self.dino_y) + self.DINO_HEIGHT - m
 
-        for obs_x, obs_w, obs_h in self.obstacles:
+        for obs_x, obs_w, obs_h, obs_type, obs_y in self.obstacles:
             obs_left = int(obs_x)
-            obs_top = self.GROUND_Y - obs_h
+            obs_top = int(obs_y)
             obs_right = int(obs_x) + obs_w
-            obs_bottom = self.GROUND_Y
+            obs_bottom = int(obs_y) + obs_h
             if (dino_right > obs_left and dino_left < obs_right and
                     dino_bottom > obs_top and dino_top < obs_bottom):
                 self.crashed = True
@@ -193,17 +249,18 @@ class DinoRunEnv:
         # Draw dinosaur
         dy = int(self.dino_y)
         cv2.rectangle(canvas,
-                      (self.DINO_X, dy),
-                      (self.DINO_X + self.DINO_WIDTH, dy + self.DINO_HEIGHT),
+                      (self.dino_x, dy),
+                      (self.dino_x + self.DINO_WIDTH, dy + self.DINO_HEIGHT),
                       255, 2)
 
         # Draw obstacles (only those within the crop)
-        for obs_x, obs_w, obs_h in self.obstacles:
+        for obs_x, obs_w, obs_h, obs_type, obs_y in self.obstacles:
             ox = int(obs_x)
             if -obs_w < ox < self.CROP_WIDTH:
+                oy = int(obs_y)
                 cv2.rectangle(canvas,
-                              (max(0, ox), self.GROUND_Y - obs_h),
-                              (min(self.CROP_WIDTH, ox + obs_w), self.GROUND_Y),
+                              (max(0, ox), oy),
+                              (min(self.CROP_WIDTH, ox + obs_w), oy + obs_h),
                               255, 2)
 
         obs = cv2.resize(canvas, (self.OBS_SIZE, self.OBS_SIZE),
@@ -211,7 +268,7 @@ class DinoRunEnv:
         obs = np.expand_dims(obs, -1)  # (80, 80, 1)
         return obs
 
-    def get_features(self):
+    def get_features(self, add_noise=False):
         """
         Return normalized feature vector describing the game state.
 
@@ -224,24 +281,35 @@ class DinoRunEnv:
             5: is_jumping (0 or 1)
             6: distance to 2nd nearest obstacle (normalized)
             7: current game speed (normalized by MAX_SPEED)
+
+        Filters out high-flying pterodactyls that the dino can safely run under
+        (matching the play_browser.py JS logic).
         """
         ground_y = float(self.GROUND_Y - self.DINO_HEIGHT)
 
-        # Sort obstacles by x position to find nearest
-        ahead = sorted(
-            [o for o in self.obstacles if o[0] + o[1] > self.DINO_X],
-            key=lambda o: o[0]
-        )
+        # Filter obstacles: only those ahead of dino AND that require jumping
+        # High pterodactyls (top edge above dino's standing head) can be ignored
+        dino_standing_top = self.GROUND_Y - self.DINO_HEIGHT
+        ahead = []
+        for obs in self.obstacles:
+            obs_x, obs_w, obs_h, obs_type, obs_y = obs
+            if obs_x + obs_w <= self.dino_x:
+                continue  # Already passed
+            # Skip high pterodactyls that dino can run under
+            if obs_type == 'ptero' and obs_y + obs_h <= dino_standing_top:
+                continue
+            ahead.append(obs)
+        ahead.sort(key=lambda o: o[0])
 
         if len(ahead) >= 1:
-            dist1 = (ahead[0][0] - self.DINO_X) / self.GAME_WIDTH
+            dist1 = (ahead[0][0] - self.dino_x) / self.GAME_WIDTH
             w1 = ahead[0][1] / 51.0
             h1 = ahead[0][2] / 50.0
         else:
             dist1, w1, h1 = 1.0, 0.0, 0.0
 
         if len(ahead) >= 2:
-            dist2 = (ahead[1][0] - self.DINO_X) / self.GAME_WIDTH
+            dist2 = (ahead[1][0] - self.dino_x) / self.GAME_WIDTH
         else:
             dist2 = 1.0
 
@@ -250,8 +318,15 @@ class DinoRunEnv:
         jumping = 1.0 if self.is_jumping else 0.0
         speed = self.speed / self.MAX_SPEED  # 0.46 at start, 1.0 at max
 
-        return np.array([dist1, w1, h1, dino_height, dino_vel, jumping, dist2, speed],
-                        dtype=np.float32)
+        features = np.array([dist1, w1, h1, dino_height, dino_vel, jumping, dist2, speed],
+                            dtype=np.float32)
+
+        # Add small Gaussian noise for training robustness
+        if add_noise and self.feature_noise > 0:
+            noise = np.random.normal(0, self.feature_noise, features.shape).astype(np.float32)
+            features = features + noise
+
+        return features
 
     def get_score(self):
         return self.score

@@ -2,3 +2,5 @@ torch
 numpy
 opencv-python
 selenium
+matplotlib
+tensorboard

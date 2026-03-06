@@ -85,7 +85,6 @@ method — we wait for the episode to finish to get exact G_t values.
 """
 
 import os
-import sys
 
 import numpy as np
 import torch
@@ -99,7 +98,7 @@ from torch.distributions import Categorical
 # vectors as state observations.  evaluate(), plot_training(), and
 # save_results() are utility functions shared across all algorithm files.
 # ---------------------------------------------------------------------------
-from common import (
+from dino_rl.common import (
     DinoFeatureEnv,
     evaluate,
     plot_training,
@@ -107,6 +106,7 @@ from common import (
     create_writer,
     FEATURE_DIM,
     ACTION_SIZE,
+    RESULTS_DIR,
 )
 
 # ---------------------------------------------------------------------------
@@ -441,7 +441,7 @@ def train(
     save_results('reinforce_baseline', train_scores, final_eval)
 
     plot_path = os.path.join(
-        os.path.dirname(__file__), 'results', 'reinforce_baseline.png'
+        RESULTS_DIR, 'reinforce_baseline.png'
     )
     plot_training(
         train_scores,

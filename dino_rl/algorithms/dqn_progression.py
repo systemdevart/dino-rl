@@ -48,7 +48,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-from common import (
+from dino_rl.common import (
     DinoFeatureEnv,
     evaluate,
     plot_training,
@@ -56,6 +56,7 @@ from common import (
     create_writer,
     FEATURE_DIM,
     ACTION_SIZE,
+    RESULTS_DIR,
 )
 
 # ---------------------------------------------------------------------------
@@ -915,7 +916,7 @@ def train_agent(
 # ===========================================================================
 
 if __name__ == '__main__':
-    results_dir = os.path.join(os.path.dirname(__file__), 'results')
+    results_dir = RESULTS_DIR
     n_episodes = 500
 
     print(f"Device: {DEVICE}")

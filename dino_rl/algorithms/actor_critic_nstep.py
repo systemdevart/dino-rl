@@ -95,7 +95,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 
-from common import DinoFeatureEnv, evaluate, plot_training, save_results, create_writer, FEATURE_DIM, ACTION_SIZE
+from dino_rl.common import DinoFeatureEnv, evaluate, plot_training, save_results, create_writer, FEATURE_DIM, ACTION_SIZE, RESULTS_DIR
 
 # ---------------------------------------------------------------------------
 # Device selection
@@ -494,7 +494,7 @@ def train(writer=None):
     plot_training(
         train_scores,
         title='N-Step Actor-Critic (n=5) Training Curve',
-        path='algorithms/results/actor_critic_nstep.png',
+        path=os.path.join(RESULTS_DIR, 'actor_critic_nstep.png'),
         eval_scores=eval_history,
     )
 

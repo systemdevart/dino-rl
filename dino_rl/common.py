@@ -10,19 +10,17 @@ Provides:
 """
 import json
 import os
-import sys
 import time
 
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 
-# Add parent directory to path so we can import the gym environment
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'gym-environments'))
-from gym_dinorun.envs.dinorun_env import DinoRunEnv
+from dino_rl.env import DinoRunEnv
 
 FEATURE_DIM = 8   # Number of features from env.get_features()
 ACTION_SIZE = 2    # 0: do nothing, 1: jump
-RESULTS_DIR = os.path.join(os.path.dirname(__file__), 'results')
+_PROJECT_ROOT = os.path.join(os.path.dirname(__file__), '..')
+RESULTS_DIR = os.path.join(_PROJECT_ROOT, 'results')
 
 
 class DinoFeatureEnv:
@@ -178,7 +176,7 @@ def save_results(algo_name, train_scores, eval_result=None):
     print(f"Saved results: {path}")
 
 
-LOGS_DIR = os.path.join(os.path.dirname(__file__), 'runs')
+LOGS_DIR = os.path.join(RESULTS_DIR, 'runs')
 
 
 def create_writer(algo_name):

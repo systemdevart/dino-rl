@@ -113,7 +113,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from common import (
+from dino_rl.common import (
     DinoFeatureEnv,
     evaluate,
     plot_training,
@@ -121,6 +121,7 @@ from common import (
     FEATURE_DIM,
     ACTION_SIZE,
     create_writer,
+    RESULTS_DIR,
 )
 
 # ---------------------------------------------------------------------------
@@ -448,7 +449,7 @@ def train(writer=None):
     plot_training(
         train_scores,
         title="Semi-gradient TD(0) Value Network -- Training Scores",
-        path="results/value_network_td0_training.png",
+        path=os.path.join(RESULTS_DIR, "value_network_td0_training.png"),
         eval_scores=eval_log,
     )
 

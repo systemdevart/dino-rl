@@ -25,7 +25,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from gym_dinorun.envs.dinorun_env import DinoRunEnv
+from dino_rl.env import DinoRunEnv
+from dino_rl.networks import DuelingDQN
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -34,33 +35,11 @@ print(f"Using device: {device}")
 FEATURE_DIM = 8  # Number of features from env.get_features() (includes speed)
 
 
-class DuelingDQN(nn.Module):
-    """
-    Dueling DQN: separates state value V(s) from advantage A(s,a).
-    Q(s,a) = V(s) + A(s,a) - mean(A)
-    This helps when many actions have similar values (e.g., obstacle is far away).
-    """
-    def __init__(self, input_dim, action_size):
-        super().__init__()
-        self.feature = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-        )
-        self.value = nn.Linear(256, 1)
-        self.advantage = nn.Linear(256, action_size)
-
-    def forward(self, x):
-        feat = self.feature(x)
-        value = self.value(feat)
-        advantage = self.advantage(feat)
-        return value + advantage - advantage.mean(dim=1, keepdim=True)
-
-
 class Agent:
     def __init__(self, action_size: int):
-        self.weight_backup = "models/dino_runner.pth"
+        self.weight_backup = os.path.join(
+            os.path.dirname(__file__), '..', 'checkpoints', 'dino_runner.pth'
+        )
         self.action_size = action_size
         self.memory = deque(maxlen=200000)
         self.epsilon = 1.0
@@ -72,7 +51,7 @@ class Agent:
         self.train_freq = 4  # Train every 4 steps
         self.min_replay_size = 2000  # Min transitions before training starts
 
-        os.makedirs("models", exist_ok=True)
+        os.makedirs(os.path.dirname(self.weight_backup), exist_ok=True)
 
         self.model = DuelingDQN(FEATURE_DIM, action_size).to(device)
         self.target_model = DuelingDQN(FEATURE_DIM, action_size).to(device)

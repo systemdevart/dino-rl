@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dino-rl"
+version = "0.1.0"
+description = "Reinforcement learning algorithms for the Chrome Dino game"
+requires-python = ">=3.8"
+dependencies = [
+    "torch",
+    "numpy",
+    "opencv-python",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+browser = ["selenium"]
+tensorboard = ["tensorboard"]
+all = ["selenium", "tensorboard"]
+
+[tool.setuptools.packages.find]
+include = ["dino_rl*"]
+
+[project.scripts]
+dino-train = "dino_rl.train_dqn:main"
+dino-play = "dino_rl.play_browser:main"
+dino-train-all = "dino_rl.algorithms.train_all:main"

@@ -72,7 +72,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 
-from common import (
+from dino_rl.common import (
     DinoFeatureEnv,
     evaluate,
     plot_training,
@@ -80,6 +80,7 @@ from common import (
     create_writer,
     FEATURE_DIM,
     ACTION_SIZE,
+    RESULTS_DIR,
 )
 
 # ---------------------------------------------------------------------------
@@ -326,7 +327,7 @@ def train(
     plot_training(
         train_scores,
         title='REINFORCE (Monte Carlo Policy Gradient)',
-        path=os.path.join(os.path.dirname(__file__), 'results', 'reinforce.png'),
+        path=os.path.join(RESULTS_DIR, 'reinforce.png'),
         eval_scores=eval_history,
     )
 

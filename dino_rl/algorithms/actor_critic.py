@@ -106,7 +106,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 
-from common import DinoFeatureEnv, evaluate, plot_training, save_results, create_writer, FEATURE_DIM, ACTION_SIZE
+from dino_rl.common import DinoFeatureEnv, evaluate, plot_training, save_results, create_writer, FEATURE_DIM, ACTION_SIZE, RESULTS_DIR
 
 # ---------------------------------------------------------------------------
 # Device detection — use GPU if available for faster training.
@@ -437,7 +437,7 @@ def train(n_episodes=2000, lr=0.0005, gamma=0.99, entropy_coeff=0.01,
     plot_training(
         train_scores,
         title='One-Step Actor-Critic — Dino Game',
-        path=os.path.join(os.path.dirname(__file__), 'results', 'actor_critic.png'),
+        path=os.path.join(RESULTS_DIR, 'actor_critic.png'),
         eval_scores=eval_history,
     )
 

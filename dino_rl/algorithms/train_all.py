@@ -3,16 +3,14 @@
 Train all RL algorithms sequentially with TensorBoard logging.
 
 Usage:
-    cd algorithms/
-    python train_all.py              # train all algorithms
-    python train_all.py --algo ppo   # train just one
+    python -m dino_rl.algorithms.train_all              # train all algorithms
+    python -m dino_rl.algorithms.train_all --algo ppo   # train just one
 
 View TensorBoard:
-    tensorboard --logdir algorithms/runs
+    tensorboard --logdir results/runs
 """
 import argparse
 import time
-import sys
 import os
 
 # Suppress TensorFlow warnings triggered by TensorBoard import
@@ -23,59 +21,57 @@ import warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='scipy')
 warnings.filterwarnings('ignore', category=UserWarning, module='tensorboard')
 
-# Ensure we can import common and gym env
-sys.path.insert(0, os.path.dirname(__file__))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'gym-environments'))
+from dino_rl.common import RESULTS_DIR, LOGS_DIR
 
 
 def train_value_network():
     """Phase 2: Semi-gradient TD(0) value network."""
-    import value_network
+    from dino_rl.algorithms import value_network
     value_network.NUM_EPISODES = 1000
     value_network.EVAL_INTERVAL = 200
     value_network.EVAL_EPISODES = 10
     value_network.EPSILON_DECAY = 800
-    from value_network import train
+    from dino_rl.algorithms.value_network import train
     train()
 
 
 def train_reinforce():
     """Phase 3: REINFORCE Monte Carlo policy gradient."""
-    from reinforce import train
+    from dino_rl.algorithms.reinforce import train
     train(n_episodes=2000, print_every=50, eval_every=200)
 
 
 def train_reinforce_baseline():
     """Phase 4: REINFORCE with baseline."""
-    from reinforce_baseline import train
+    from dino_rl.algorithms.reinforce_baseline import train
     train(n_episodes=2000, print_every=50, eval_every=200)
 
 
 def train_actor_critic():
     """Phase 5: One-step Actor-Critic."""
-    from actor_critic import train
+    from dino_rl.algorithms.actor_critic import train
     train(n_episodes=2000, print_every=50, eval_every=200)
 
 
 def train_actor_critic_nstep():
     """Phase 6: N-step Actor-Critic."""
-    import actor_critic_nstep
+    from dino_rl.algorithms import actor_critic_nstep
     actor_critic_nstep.NUM_EPISODES = 2000
     actor_critic_nstep.EVAL_EVERY = 200
     actor_critic_nstep.PRINT_EVERY = 50
-    from actor_critic_nstep import train
+    from dino_rl.algorithms.actor_critic_nstep import train
     train()
 
 
 def train_td_lambda():
     """Phase 7: True Online TD(lambda)."""
-    from td_lambda import train
+    from dino_rl.algorithms.td_lambda import train
     train(n_episodes=1000, print_every=50, eval_every=200)
 
 
 def train_dqn_progression():
     """Phase 8: DQN stability pack (4 variants)."""
-    from dqn_progression import (
+    from dino_rl.algorithms.dqn_progression import (
         VanillaDQN, DoubleDQN, DuelingDoubleDQN, DuelingDoubleDQN_PER,
         train_agent, evaluate, save_results, DEVICE
     )
@@ -91,13 +87,13 @@ def train_dqn_progression():
 
 def train_ppo():
     """Phase 9: PPO."""
-    from ppo import train
+    from dino_rl.algorithms.ppo import train
     train(n_updates=150, print_every=5, eval_every=25)
 
 
 def train_a2c():
     """Phase 10: A2C."""
-    from a2c import train
+    from dino_rl.algorithms.a2c import train
     train(n_updates=3000, print_every=50, eval_every=500)
 
 
@@ -122,15 +118,14 @@ def main():
     args = parser.parse_args()
 
     # Clear old TB runs
-    runs_dir = os.path.join(os.path.dirname(__file__), 'runs')
+    runs_dir = LOGS_DIR
     if os.path.exists(runs_dir):
         import shutil
         shutil.rmtree(runs_dir)
     os.makedirs(runs_dir, exist_ok=True)
 
     # Also ensure results dir exists
-    results_dir = os.path.join(os.path.dirname(__file__), 'results')
-    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
 
     if args.algo:
         algos = {args.algo: ALGORITHMS[args.algo]}

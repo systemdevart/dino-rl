@@ -9,41 +9,23 @@ Requirements:
     pip install selenium torch numpy
 
 Usage:
-    python play_browser.py                    # Run with default model
-    python play_browser.py --model path.pth   # Run with specific model
-    python play_browser.py --games 5          # Play N games then quit
+    python -m dino_rl.play_browser                    # Run with default model
+    python -m dino_rl.play_browser --model path.pth   # Run with specific model
+    python -m dino_rl.play_browser --games 5          # Play N games then quit
 """
 import argparse
+import os
 import time
 
 import torch
-import torch.nn as nn
 
 from selenium import webdriver
 from selenium.common.exceptions import WebDriverException
 
+from dino_rl.networks import DuelingDQN
+
 
 FEATURE_DIM = 8  # Includes current speed
-
-
-class DuelingDQN(nn.Module):
-    """Same architecture as training - must match exactly."""
-    def __init__(self, input_dim, action_size):
-        super().__init__()
-        self.feature = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-        )
-        self.value = nn.Linear(256, 1)
-        self.advantage = nn.Linear(256, action_size)
-
-    def forward(self, x):
-        feat = self.feature(x)
-        value = self.value(feat)
-        advantage = self.advantage(feat)
-        return value + advantage - advantage.mean(dim=1, keepdim=True)
 
 
 # JavaScript injected into the page to extract game state features.
@@ -230,9 +212,12 @@ def play(driver, model, device, max_games=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Play Chrome Dino with trained DQN")
+    default_model = os.path.join(
+        os.path.dirname(__file__), '..', 'checkpoints', 'dino_runner.pth'
+    )
     parser.add_argument(
-        "--model", default="models/dino_runner.pth",
-        help="Path to trained model weights (default: models/dino_runner.pth)"
+        "--model", default=default_model,
+        help="Path to trained model weights (default: checkpoints/dino_runner.pth)"
     )
     parser.add_argument(
         "--games", type=int, default=None,

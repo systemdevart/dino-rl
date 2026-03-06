@@ -5,41 +5,48 @@ A comprehensive educational implementation of RL algorithms from Sutton & Barto,
 ## Quick Start
 
 ```bash
-pip install -r requirements.txt
-pip install -e gym-environments
+pip install -e .
 
 # Train all algorithms with TensorBoard logging
-cd algorithms/
-python train_all.py
+python -m dino_rl.algorithms.train_all
 
 # View training curves
-tensorboard --logdir algorithms/runs
+tensorboard --logdir results/runs
+
+# Train the standalone DQN agent
+python -m dino_rl.train_dqn
+
+# Play in the browser with a trained model
+python -m dino_rl.play_browser
 ```
 
 ## Project Structure
 
 ```
 Reinforcement_Learning/
-├── gym-environments/          # Chrome Dino game simulation (pure Python)
-│   └── gym_dinorun/envs/
-│       └── dinorun_env.py     # Game physics, obstacles, feature extraction
-├── chrome_dino_run.py         # Standalone DQN training script
-├── play_browser.py            # Play trained model in real Chrome browser
-├── algorithms/
-│   ├── common.py              # Shared env wrapper, eval, plotting, TB logging
-│   ├── train_all.py           # Train all algorithms sequentially
-│   ├── value_network.py       # Semi-gradient TD(0) value network
-│   ├── reinforce.py           # REINFORCE (Monte Carlo policy gradient)
-│   ├── reinforce_baseline.py  # REINFORCE with learned baseline
-│   ├── actor_critic.py        # One-step Actor-Critic
-│   ├── actor_critic_nstep.py  # N-step Actor-Critic
-│   ├── td_lambda.py           # True Online TD(lambda)
-│   ├── dqn_progression.py     # DQN -> Double -> Dueling -> PER
-│   ├── ppo.py                 # Proximal Policy Optimization
-│   ├── a2c.py                 # Advantage Actor-Critic (synchronous)
-│   ├── results/               # JSON results + training plots
-│   └── runs/                  # TensorBoard event files
-└── models/                    # Saved model weights
+├── pyproject.toml               # Package metadata and dependencies
+├── requirements.txt             # pip install -r convenience
+├── results/                     # JSON results + training plots
+├── checkpoints/                 # Saved model weights
+│   └── dino_runner.pth
+└── dino_rl/                     # Main package
+    ├── __init__.py
+    ├── env.py                   # Pure Python Chrome Dino game simulation
+    ├── common.py                # Shared env wrapper, eval, plotting, TB logging
+    ├── networks.py              # Shared DuelingDQN architecture
+    ├── train_dqn.py             # Standalone DQN training script
+    ├── play_browser.py          # Play trained model in real Chrome browser
+    └── algorithms/
+        ├── train_all.py         # Train all algorithms sequentially
+        ├── value_network.py     # Semi-gradient TD(0) value network
+        ├── reinforce.py         # REINFORCE (Monte Carlo policy gradient)
+        ├── reinforce_baseline.py# REINFORCE with learned baseline
+        ├── actor_critic.py      # One-step Actor-Critic
+        ├── actor_critic_nstep.py# N-step Actor-Critic
+        ├── td_lambda.py         # True Online TD(lambda)
+        ├── dqn_progression.py   # DQN -> Double -> Dueling -> PER
+        ├── ppo.py               # Proximal Policy Optimization
+        └── a2c.py               # Advantage Actor-Critic (synchronous)
 ```
 
 ## Algorithms and Results
@@ -76,7 +83,7 @@ All algorithms trained on the same Dino environment with 8-dimensional feature v
 
 ## Environment
 
-The `gym-environments/` directory contains a pure-Python Chrome Dinosaur game simulation with:
+The `dino_rl/env.py` module contains a pure-Python Chrome Dinosaur game simulation with:
 - Accurate physics (acceleration from speed 6 to 13)
 - Cacti and pterodactyl obstacles
 - Domain randomization (obstacle clusters, variable dino position)

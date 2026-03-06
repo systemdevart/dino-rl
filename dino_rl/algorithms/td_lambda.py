@@ -135,7 +135,6 @@ action whose average V(s') is higher.  Under epsilon-greedy, we choose
 randomly with probability ε and greedily otherwise.
 """
 
-import sys
 import os
 import numpy as np
 from collections import deque
@@ -147,8 +146,7 @@ import torch.optim as optim
 # ---------------------------------------------------------------------------
 # Import shared infrastructure
 # ---------------------------------------------------------------------------
-sys.path.insert(0, os.path.dirname(__file__))
-from common import (
+from dino_rl.common import (
     DinoFeatureEnv,
     evaluate,
     plot_training,
@@ -156,6 +154,7 @@ from common import (
     create_writer,
     FEATURE_DIM,
     ACTION_SIZE,
+    RESULTS_DIR,
 )
 
 # ---------------------------------------------------------------------------
@@ -634,7 +633,7 @@ def train(n_episodes: int = 2000, print_every: int = 10, eval_every: int = 100, 
     plot_training(
         all_scores,
         title='True Online TD(λ) — Chrome Dino',
-        path=os.path.join(os.path.dirname(__file__), 'results', 'td_lambda.png'),
+        path=os.path.join(RESULTS_DIR, 'td_lambda.png'),
         eval_scores=eval_history,
     )
 

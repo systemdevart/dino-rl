@@ -17,9 +17,13 @@ class DuelingDQN(nn.Module):
     def __init__(self, input_dim, action_size):
         super().__init__()
         self.feature = nn.Sequential(
-            nn.Linear(input_dim, 256),
+            nn.Linear(input_dim, 512),
             nn.ReLU(),
-            nn.Linear(256, 256),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
             nn.ReLU(),
         )
         self.value = nn.Linear(256, 1)

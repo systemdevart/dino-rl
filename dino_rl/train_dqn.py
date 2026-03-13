@@ -179,6 +179,9 @@ class TRexRunner:
         best_eval = 0
         scores_window = deque(maxlen=100)
 
+        total_params = sum(p.numel() for p in self.agent.model.parameters())
+        print(f"Network size: {total_params:,} parameters")
+
         try:
             for e in range(self.episodes):
                 self.env.reset()
@@ -246,7 +249,7 @@ class TRexRunner:
                         self.agent.save_model()
                         print(f"  ** New best eval! Saved model.")
 
-                    if best_eval >= 1500:
+                    if best_eval >= 10000:
                         print(f"\n*** TARGET REACHED! Eval avg: {best_eval} ***")
                         break
 

@@ -145,10 +145,12 @@ class TRexRunner:
         self.episodes = 10000
         self.eval_freq = 25  # Run eval episode every N training episodes
         self.eval_runs = 5   # Average over N eval episodes for reliability
-        # Training env uses domain randomization + feature noise
-        self.env = DinoRunEnv(domain_randomization=True, feature_noise=0.02)
+        # Training env: no DR (browser game always uses dino_x=50)
+        self.env = DinoRunEnv(domain_randomization=False, feature_noise=0.0,
+                              skip_clear_time=True)
         # Eval env uses no randomization for consistent benchmarking
-        self.eval_env = DinoRunEnv(domain_randomization=False, feature_noise=0.0)
+        self.eval_env = DinoRunEnv(domain_randomization=False, feature_noise=0.0,
+                                   skip_clear_time=True)
         self.action_size = self.env.action_space.n
         self.agent = Agent(self.action_size)
 
@@ -180,7 +182,7 @@ class TRexRunner:
         try:
             for e in range(self.episodes):
                 self.env.reset()
-                state = self.env.get_features(add_noise=True)
+                state = self.env.get_features()
 
                 game_score = 0
 
@@ -190,11 +192,15 @@ class TRexRunner:
                     action = self.agent.act(state)
                     _, reward, score, done = self.env.step(action)
 
-                    # Scale crash penalty for stronger signal
+                    # Reward shaping (matching actor-critic's proven config):
+                    # +0.01 per step keeps discounted survival reward small,
+                    # -10.0 crash penalty dominates for short (bad) episodes.
                     if done:
                         reward = -10.0
+                    else:
+                        reward = 0.01
 
-                    next_state = self.env.get_features(add_noise=True)
+                    next_state = self.env.get_features()
 
                     self.agent.remember(state, action, reward, next_state, done)
 
@@ -240,7 +246,7 @@ class TRexRunner:
                         self.agent.save_model()
                         print(f"  ** New best eval! Saved model.")
 
-                    if best_eval >= 5000:
+                    if best_eval >= 1500:
                         print(f"\n*** TARGET REACHED! Eval avg: {best_eval} ***")
                         break
 

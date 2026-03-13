@@ -13,7 +13,6 @@ import os
 import time
 
 import numpy as np
-from torch.utils.tensorboard import SummaryWriter
 
 from dino_rl.env import DinoRunEnv
 
@@ -37,6 +36,7 @@ class DinoFeatureEnv:
         self.env = DinoRunEnv(
             domain_randomization=domain_randomization,
             feature_noise=feature_noise,
+            skip_clear_time=True,
         )
         self.action_space = self.env.action_space
 
@@ -181,6 +181,8 @@ LOGS_DIR = os.path.join(RESULTS_DIR, 'runs')
 
 def create_writer(algo_name):
     """Create a TensorBoard SummaryWriter for the given algorithm."""
+    from torch.utils.tensorboard import SummaryWriter
+
     log_dir = os.path.join(LOGS_DIR, algo_name)
     os.makedirs(log_dir, exist_ok=True)
     return SummaryWriter(log_dir=log_dir)

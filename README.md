@@ -49,45 +49,43 @@ Reinforcement_Learning/
         └── a2c.py               # Advantage Actor-Critic (synchronous)
 ```
 
-## Algorithms and Results
+## Standalone DQN (Browser Play)
 
-All algorithms trained on the same Dino environment with 8-dimensional feature vectors (obstacle distance, size, speed, dino state). Reward: +0.01 per step, -10.0 on crash.
+The standalone Dueling Double DQN (`dino_rl/train_dqn.py`) is the model used for browser play. Trained on the 1:1 faithful environment:
 
-### Converged
+| Metric              | Value |
+| ------------------- | ----- |
+| Eval Avg (30 games) | 1,562 |
+| Eval Median         | 1,564 |
+| Eval Max            | 2,169 |
+| Eval Min            | 635   |
 
-| Algorithm | Eval Avg | Eval Max | Sutton & Barto Reference |
-|---|---|---|---|
-| One-step Actor-Critic | 19,573 | 30,050 | Ch 13.5 |
-| VanillaDQN | 1,517 | 1,984 | Mnih 2015 |
-| DuelingDoubleDQN | 1,231 | 1,996 | Wang 2016 |
-| DuelingDoubleDQN + PER | 1,053 | 1,771 | Schaul 2016 |
-| DoubleDQN | 342 | 568 | van Hasselt 2016 |
+## Algorithm Comparison
 
-### Did Not Converge (educational value in understanding *why*)
-
-| Algorithm | Train Avg | Eval Avg | Limitation |
-|---|---|---|---|
-| REINFORCE | 103 | 62 | MC returns insensitive to episode quality with gamma=0.99 |
-| REINFORCE + baseline | 95 | 61 | Baseline doesn't fix the MC return problem |
-| PPO | 97 | 61 | Clipping slows learning; needs 10x more updates |
-| N-step Actor-Critic | 87 | 60 | Fewer updates/episode than 1-step AC |
-| A2C | 76 | 60 | Briefly peaked at 19,616 then collapsed |
+All algorithms trained on the same Dino environment with 8-dimensional feature vectors (obstacle distance, size, speed, dino state). Reward: +0.01 per step, -10.0 on crash. Scores use the real game's formula: `round(distance * 0.025)`.
 
 ### Key Educational Takeaways
 
 1. **DQN methods converge stably** via experience replay + target networks
-2. **One-step Actor-Critic is the only policy gradient method that converges** -- per-step TD updates propagate the crash penalty backward through the value function
+2. **Reward shaping matters** -- +0.1/step survival reward swamps the -10 crash penalty; reducing to +0.01/step makes the crash signal dominate for short (bad) episodes
 3. **REINFORCE can't solve this task** -- with gamma=0.99, the discounted return G_t converges to ~1.0 regardless of episode length, providing no learning signal
-4. **Actor-Critic instability motivates PPO** -- AC oscillated between eval 60 and 24,000; PPO's clipping prevents this but also prevents rapid learning
-5. **A2C's brief spike then collapse** demonstrates why trust regions (PPO) or replay buffers (DQN) matter for stable learning
+4. **Actor-Critic instability** -- oscillates between good and bad policies without replay buffers for stabilisation
 
 ## Environment
 
-The `dino_rl/env.py` module contains a pure-Python Chrome Dinosaur game simulation with:
-- Accurate physics (acceleration from speed 6 to 13)
-- Cacti and pterodactyl obstacles
-- Domain randomization (obstacle clusters, variable dino position)
+The `dino_rl/env.py` module is a **1:1 faithful port** of Chromium's T-Rex Runner (`offline.js`):
+
+- Exact physics: speed-dependent jump velocity (`-10 - speed/10`), gravity 0.6, endJump() at MAX_JUMP_HEIGHT
+- Exact obstacle types: CACTUS_SMALL (17x35), CACTUS_LARGE (25x50), PTERODACTYL (46x40, minSpeed 8.5)
+- Exact gap formula: `round(width * speed + minGap * 0.6)`, maxGap = 1.5x
+- Two-phase collision: broad-phase 1px-margin boxes + narrow-phase per-part AABB
+- Exact scoring: `round(distanceRan * 0.025)`
+- Multi-size obstacles (1-3 cacti based on speed), duplicate type prevention
 - 8-dimensional feature extraction for RL agents
+
+## Study Plan
+
+See **[STUDY_PLAN.md](STUDY_PLAN.md)** for a detailed learning guide: what to read, what to research, commands to run, metrics to track, and a 6-week study schedule covering all algorithms from foundations to advanced methods.
 
 ## Requirements
 

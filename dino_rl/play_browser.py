@@ -61,7 +61,7 @@ return (function() {
     var dist1, w1, h1;
     if (ahead.length >= 1) {
         dist1 = (ahead[0].x - tRex.xPos) / canvasWidth;
-        w1 = ahead[0].w / 51.0;
+        w1 = ahead[0].w / 75.0;   // max: CACTUS_LARGE * 3 = 75
         h1 = ahead[0].h / 50.0;
     } else {
         dist1 = 1.0; w1 = 0.0; h1 = 0.0;
@@ -71,12 +71,12 @@ return (function() {
     var dist2 = (ahead.length >= 2) ?
         (ahead[1].x - tRex.xPos) / canvasWidth : 1.0;
 
-    // Feature 3: dino height above ground
+    // Feature 3: dino height above ground (groundYPos = 93)
     var groundY = tRex.groundYPos || 93;
-    var dinoHeight = Math.max(0, groundY - tRex.yPos) / 90.0;
+    var dinoHeight = Math.max(0, groundY - tRex.yPos) / 93.0;
 
     // Feature 4: dino vertical velocity
-    var dinoVel = tRex.jumping ? (tRex.jumpVelocity / 10.0) : 0.0;
+    var dinoVel = tRex.jumping ? (tRex.jumpVelocity / 12.0) : 0.0;
 
     // Feature 5: is jumping
     var jumping = tRex.jumping ? 1.0 : 0.0;

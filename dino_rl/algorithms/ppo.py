@@ -208,6 +208,7 @@ each piece of experience K times (typically K=4 epochs).
 """
 
 import os
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -756,22 +757,23 @@ def train(
     eval_every: int = 10,
     print_every: int = 1,
     writer=None,
+    time_budget_sec: float | None = None,
 ):
     """
     Train a policy using PPO on the Dino game.
 
-    The outer loop runs for n_updates PPO iterations.  Each iteration:
-        1.  Collects a rollout of T=2048 steps.
+    The outer loop runs for n_updates PPO iterations (or until time_budget_sec
+    is exceeded, whichever comes first).  Each iteration:
+        1.  Collects a rollout of T steps.
         2.  Computes GAE advantages and returns.
-        3.  Performs K=4 epochs of minibatch PPO updates.
-
-    Total environment steps: n_updates * T = 100 * 2048 = 204,800 steps.
+        3.  Performs K epochs of minibatch PPO updates.
 
     Args:
-        n_updates: number of PPO update iterations
+        n_updates: max number of PPO update iterations
         device: 'cuda' or 'cpu'; auto-detected if None
         eval_every: run deterministic evaluation every N updates
         print_every: print progress every N updates
+        time_budget_sec: stop training after this many seconds (None = no limit)
     """
     # ------------------------------------------------------------------
     # Setup
@@ -807,6 +809,7 @@ def train(
 
     # Initial state
     state = env.reset()
+    train_start = time.time()
 
     # ------------------------------------------------------------------
     # PPO update loop
@@ -895,6 +898,13 @@ def train(
             if eval_result['avg'] >= TARGET_EVAL_SCORE:
                 print(f"\n*** TARGET REACHED! Eval avg: {eval_result['avg']:.1f} >= {TARGET_EVAL_SCORE} ***")
                 break
+
+        # ---- 5. Time budget check ------------------------------------
+        elapsed = time.time() - train_start
+        if time_budget_sec is not None and elapsed >= time_budget_sec:
+            print(f"\n*** TIME BUDGET ({time_budget_sec:.0f}s) reached at update {update} "
+                  f"({elapsed:.1f}s elapsed) ***")
+            break
 
     # ------------------------------------------------------------------
     # Final evaluation and save

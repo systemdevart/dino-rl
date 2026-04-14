@@ -36,7 +36,7 @@ FEATURE_DIM = 8  # Number of features from env.get_features() (includes speed)
 
 
 class Agent:
-    def __init__(self, action_size: int):
+    def __init__(self, action_size: int, continue_training: bool = False):
         self.weight_backup = os.path.join(
             os.path.dirname(__file__), '..', 'checkpoints', 'dino_runner.pth'
         )
@@ -61,7 +61,7 @@ class Agent:
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
         self.loss_fn = nn.SmoothL1Loss()
 
-        if os.path.isfile(self.weight_backup):
+        if continue_training and os.path.isfile(self.weight_backup):
             checkpoint = torch.load(self.weight_backup, map_location=device,
                                     weights_only=True)
             self.model.load_state_dict(checkpoint['model'])
@@ -140,9 +140,9 @@ class Agent:
 class TRexRunner:
     """Training loop for the DQN dino agent."""
 
-    def __init__(self):
+    def __init__(self, continue_training: bool = False):
         self.batch_size = 256
-        self.episodes = 10000
+        self.episodes = 1000000 # aka "until convergence" - we will stop early if we reach target score
         self.eval_freq = 25  # Run eval episode every N training episodes
         self.eval_runs = 5   # Average over N eval episodes for reliability
         # Training env: no DR (browser game always uses dino_x=50)
@@ -152,7 +152,7 @@ class TRexRunner:
         self.eval_env = DinoRunEnv(domain_randomization=False, feature_noise=0.0,
                                    skip_clear_time=True)
         self.action_size = self.env.action_space.n
-        self.agent = Agent(self.action_size)
+        self.agent = Agent(self.action_size, continue_training=continue_training)
 
     def run_eval_episode(self):
         """Run eval_runs episodes with epsilon=0, return average score."""
@@ -249,7 +249,7 @@ class TRexRunner:
                         self.agent.save_model()
                         print(f"  ** New best eval! Saved model.")
 
-                    if best_eval >= 10000:
+                    if best_eval >= 20000:
                         print(f"\n*** TARGET REACHED! Eval avg: {best_eval} ***")
                         break
 
@@ -264,7 +264,12 @@ class TRexRunner:
 
 
 def main():
-    dino = TRexRunner()
+    import argparse
+    parser = argparse.ArgumentParser(description='Train DQN agent for Chrome Dino')
+    parser.add_argument('--continue', dest='continue_training', action='store_true',
+                        help='Continue training from saved checkpoint')
+    args = parser.parse_args()
+    dino = TRexRunner(continue_training=args.continue_training)
     dino.run()
 
 

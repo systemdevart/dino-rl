@@ -253,11 +253,12 @@ LR = 0.0003
 CLIP_EPS = 0.2
 GAMMA = 0.99
 LAM_GAE = 0.95
-PPO_EPOCHS = 4
-ROLLOUT_LEN = 2048
-MINIBATCH_SIZE = 256
+PPO_EPOCHS = 10
+ROLLOUT_LEN = 40000   # Must be > 32,600 frames needed for score 10k
+MINIBATCH_SIZE = 512
 ENTROPY_COEFF = 0.01
 VALUE_COEFF = 0.5
+TARGET_EVAL_SCORE = 10000
 
 
 # ---------------------------------------------------------------------------
@@ -293,11 +294,13 @@ class ActorCritic(nn.Module):
     def __init__(self, state_dim: int, action_dim: int):
         super().__init__()
 
-        # Shared backbone -- two hidden layers with ReLU activation.
+        # Shared backbone -- three hidden layers with ReLU activation.
         self.backbone = nn.Sequential(
-            nn.Linear(state_dim, 128),
+            nn.Linear(state_dim, 256),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
             nn.ReLU(),
         )
 
@@ -553,7 +556,16 @@ def ppo_update(
     total_policy_loss = 0.0
     total_value_loss = 0.0
     total_entropy = 0.0
+    total_clip_frac = 0.0
+    total_approx_kl = 0.0
+    total_ratio_mean = 0.0
+    total_adv_mean = 0.0
+    total_adv_std = 0.0
     n_updates = 0
+
+    # Track raw (un-normalised) advantage stats for logging
+    raw_adv_mean = buffer.advantages.mean().item()
+    raw_adv_std = buffer.advantages.std().item()
 
     for _epoch in range(ppo_epochs):
         for batch_idx in buffer.get_minibatches(minibatch_size):
@@ -575,7 +587,8 @@ def ppo_update(
             #
             # When the policy hasn't changed, ratio = exp(0) = 1.
             # As the policy diverges from the old one, ratio moves away from 1.
-            ratio = torch.exp(new_log_probs - mb_old_log_probs)
+            log_ratio = new_log_probs - mb_old_log_probs
+            ratio = torch.exp(log_ratio)
 
             # ---- Clipped surrogate objective -----------------------------
             # surr1: the "unclipped" objective -- just the importance-sampled
@@ -616,20 +629,41 @@ def ppo_update(
             # Gradient clipping: prevents catastrophically large updates
             # when the loss landscape is steep.  max_norm=0.5 is a common
             # conservative choice for PPO.
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
 
             optimizer.step()
 
             # ---- Accumulate metrics for logging --------------------------
+            with torch.no_grad():
+                # Clip fraction: how often the ratio was clipped.
+                # High clip_frac (>0.3) = policy changing too fast.
+                # Zero clip_frac = policy not changing at all.
+                clipped = ((ratio - 1.0).abs() > clip_eps).float().mean().item()
+
+                # Approx KL divergence between old and new policy.
+                # KL ≈ 0.5 * mean((log_ratio)^2)  (second-order approx)
+                # If KL > 0.05, policy is diverging too fast.
+                approx_kl = (0.5 * (log_ratio ** 2)).mean().item()
+
             total_policy_loss += policy_loss.item()
             total_value_loss += value_loss.item()
             total_entropy += -entropy_loss.item()  # flip sign for readability
+            total_clip_frac += clipped
+            total_approx_kl += approx_kl
+            total_ratio_mean += ratio.mean().item()
             n_updates += 1
 
+    n = max(n_updates, 1)
     return {
-        'policy_loss': total_policy_loss / max(n_updates, 1),
-        'value_loss': total_value_loss / max(n_updates, 1),
-        'entropy': total_entropy / max(n_updates, 1),
+        'policy_loss': total_policy_loss / n,
+        'value_loss': total_value_loss / n,
+        'entropy': total_entropy / n,
+        'clip_frac': total_clip_frac / n,
+        'approx_kl': total_approx_kl / n,
+        'ratio_mean': total_ratio_mean / n,
+        'adv_mean': raw_adv_mean,
+        'adv_std': raw_adv_std,
+        'grad_norm': grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
     }
 
 
@@ -756,6 +790,11 @@ def train(
     model = ActorCritic(FEATURE_DIM, ACTION_SIZE).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LR, eps=1e-5)
 
+    # Linear LR annealing: decay from LR to 0 over n_updates
+    def lr_lambda(update):
+        return 1.0 - update / n_updates
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
     buffer = RolloutBuffer(ROLLOUT_LEN, FEATURE_DIM, device)
 
     if writer is None:
@@ -783,7 +822,10 @@ def train(
         total_steps += ROLLOUT_LEN
         all_episode_scores.extend(episode_scores)
 
-        # ---- 2. PPO parameter update ---------------------------------
+        # ---- 2. Anneal learning rate ---------------------------------
+        scheduler.step()
+
+        # ---- 3. PPO parameter update ---------------------------------
         metrics = ppo_update(
             model=model,
             optimizer=optimizer,
@@ -805,6 +847,7 @@ def train(
                 avg_score = 0.0
                 n_eps = 0
 
+            cur_lr = optimizer.param_groups[0]['lr']
             print(
                 f"Update {update:4d}/{n_updates} | "
                 f"Steps {total_steps:7d} | "
@@ -812,12 +855,24 @@ def train(
                 f"AvgScore {avg_score:7.1f} | "
                 f"PolicyL {metrics['policy_loss']:7.4f} | "
                 f"ValueL {metrics['value_loss']:7.4f} | "
-                f"Entropy {metrics['entropy']:.4f}"
+                f"Entropy {metrics['entropy']:.4f} | "
+                f"KL {metrics['approx_kl']:.5f} | "
+                f"Clip {metrics['clip_frac']:.3f}"
             )
             writer.add_scalar('train/policy_loss', metrics['policy_loss'], update)
             writer.add_scalar('train/value_loss', metrics['value_loss'], update)
             writer.add_scalar('train/entropy', metrics['entropy'], update)
             writer.add_scalar('train/avg_score', avg_score, update)
+            writer.add_scalar('train/clip_fraction', metrics['clip_frac'], update)
+            writer.add_scalar('train/approx_kl', metrics['approx_kl'], update)
+            writer.add_scalar('train/ratio_mean', metrics['ratio_mean'], update)
+            writer.add_scalar('train/advantage_mean', metrics['adv_mean'], update)
+            writer.add_scalar('train/advantage_std', metrics['adv_std'], update)
+            writer.add_scalar('train/grad_norm', metrics['grad_norm'], update)
+            writer.add_scalar('train/learning_rate', cur_lr, update)
+            if episode_scores:
+                writer.add_scalar('train/max_score', max(episode_scores), update)
+                writer.add_scalar('train/min_score', min(episode_scores), update)
 
         # ---- 4. Periodic evaluation ----------------------------------
         if update % eval_every == 0:
@@ -836,6 +891,10 @@ def train(
                 f"min={eval_result['min']}  "
                 f"max={eval_result['max']}"
             )
+
+            if eval_result['avg'] >= TARGET_EVAL_SCORE:
+                print(f"\n*** TARGET REACHED! Eval avg: {eval_result['avg']:.1f} >= {TARGET_EVAL_SCORE} ***")
+                break
 
     # ------------------------------------------------------------------
     # Final evaluation and save

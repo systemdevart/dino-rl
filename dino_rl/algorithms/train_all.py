@@ -88,7 +88,7 @@ def train_dqn_progression():
 def train_ppo():
     """Phase 9: PPO."""
     from dino_rl.algorithms.ppo import train
-    train(n_updates=150, print_every=5, eval_every=25)
+    train(n_updates=5000, print_every=10, eval_every=50)
 
 
 def train_a2c():

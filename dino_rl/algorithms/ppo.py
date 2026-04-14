@@ -260,6 +260,7 @@ MINIBATCH_SIZE = 512
 ENTROPY_COEFF = 0.01
 VALUE_COEFF = 0.5
 TARGET_EVAL_SCORE = 10000
+SCORE_DELTA_COEFF = 0.02
 
 
 # ---------------------------------------------------------------------------
@@ -707,15 +708,19 @@ def collect_rollout(
     """
     buffer.reset()
     episode_scores = []
+    prev_score = env.get_score()
 
     for _step in range(buffer.rollout_len):
-        state_t = torch.tensor(state, dtype=torch.float32, device=device)
+        state_t = torch.as_tensor(state, dtype=torch.float32, device=device)
 
         # Get action, log_prob, and value from the current policy.
         action, log_prob, value = model.get_action_and_value(state_t)
 
         # Take the action in the environment.
         next_state, reward, done, info = env.step(action.item())
+        score_delta = max(info['score'] - prev_score, 0)
+        prev_score = info['score']
+        reward = reward + SCORE_DELTA_COEFF * score_delta
 
         # Store the transition.
         buffer.store(
@@ -731,13 +736,14 @@ def collect_rollout(
             # Episode ended.  Record the score and reset.
             episode_scores.append(info['score'])
             state = env.reset()
+            prev_score = env.get_score()
         else:
             state = next_state
 
     # Compute V(s_T) for bootstrapping the final advantage.
     # If the last step was terminal, the GAE computation will zero this out
     # via the (1 - done) factor, but we still need a value for the math.
-    last_state_t = torch.tensor(state, dtype=torch.float32, device=device)
+    last_state_t = torch.as_tensor(state, dtype=torch.float32, device=device)
     _, last_value = model(last_state_t)
     last_value = last_value.squeeze(-1).item()
 
@@ -785,6 +791,7 @@ def train(
     print(f"       gamma={GAMMA}  lam_gae={LAM_GAE}  epochs={PPO_EPOCHS}")
     print(f"       rollout_len={ROLLOUT_LEN}  minibatch={MINIBATCH_SIZE}")
     print(f"       entropy_coeff={ENTROPY_COEFF}  value_coeff={VALUE_COEFF}")
+    print(f"       score_delta_coeff={SCORE_DELTA_COEFF}")
     print(f"       total steps = {n_updates} * {ROLLOUT_LEN} = {n_updates * ROLLOUT_LEN}")
     print()
 
@@ -825,10 +832,7 @@ def train(
         total_steps += ROLLOUT_LEN
         all_episode_scores.extend(episode_scores)
 
-        # ---- 2. Anneal learning rate ---------------------------------
-        scheduler.step()
-
-        # ---- 3. PPO parameter update ---------------------------------
+        # ---- 2. PPO parameter update ---------------------------------
         metrics = ppo_update(
             model=model,
             optimizer=optimizer,
@@ -840,7 +844,10 @@ def train(
             value_coeff=VALUE_COEFF,
         )
 
-        # ---- 3. Logging ----------------------------------------------
+        # ---- 3. Anneal learning rate ---------------------------------
+        scheduler.step()
+
+        # ---- 4. Logging ----------------------------------------------
         if update % print_every == 0:
             # Average score from episodes completed during this rollout.
             if episode_scores:
@@ -877,11 +884,11 @@ def train(
                 writer.add_scalar('train/max_score', max(episode_scores), update)
                 writer.add_scalar('train/min_score', min(episode_scores), update)
 
-        # ---- 4. Periodic evaluation ----------------------------------
+        # ---- 5. Periodic evaluation ----------------------------------
         if update % eval_every == 0:
             @torch.no_grad()
             def policy_fn(s, _model=model, _device=device):
-                s_t = torch.tensor(s, dtype=torch.float32, device=_device)
+                s_t = torch.as_tensor(s, dtype=torch.float32, device=_device)
                 logits, _ = _model(s_t)
                 return logits.argmax().item()
 
@@ -899,7 +906,7 @@ def train(
                 print(f"\n*** TARGET REACHED! Eval avg: {eval_result['avg']:.1f} >= {TARGET_EVAL_SCORE} ***")
                 break
 
-        # ---- 5. Time budget check ------------------------------------
+        # ---- 6. Time budget check ------------------------------------
         elapsed = time.time() - train_start
         if time_budget_sec is not None and elapsed >= time_budget_sec:
             print(f"\n*** TIME BUDGET ({time_budget_sec:.0f}s) reached at update {update} "
@@ -915,7 +922,7 @@ def train(
 
     @torch.no_grad()
     def final_policy_fn(s):
-        s_t = torch.tensor(s, dtype=torch.float32, device=device)
+        s_t = torch.as_tensor(s, dtype=torch.float32, device=device)
         logits, _ = model(s_t)
         return logits.argmax().item()
 

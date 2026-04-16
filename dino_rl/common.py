@@ -15,8 +15,8 @@ import time
 import numpy as np
 
 from dino_rl.env import DinoRunEnv
+from dino_rl.feature_contract import FEATURE_DIM
 
-FEATURE_DIM = 8   # Number of features from env.get_features()
 ACTION_SIZE = 2    # 0: do nothing, 1: jump
 _PROJECT_ROOT = os.path.join(os.path.dirname(__file__), '..')
 RESULTS_DIR = os.path.join(_PROJECT_ROOT, 'results')

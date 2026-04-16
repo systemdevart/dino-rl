@@ -1,5 +1,5 @@
 """
-Play Chrome Dino game in the browser using the trained DQN model.
+Play Chrome Dino game in the browser using a trained DQN or PPO policy.
 
 Uses Selenium to open Chrome to chrome://dino and controls the game
 entirely via JavaScript (state extraction + jump commands).
@@ -9,111 +9,22 @@ Requirements:
     pip install selenium torch numpy
 
 Usage:
-    python -m dino_rl.play_browser                    # Run with default model
-    python -m dino_rl.play_browser --model path.pth   # Run with specific model
-    python -m dino_rl.play_browser --games 5          # Play N games then quit
+    python -m dino_rl.play_browser                      # Run with default model
+    python -m dino_rl.play_browser --model path.pth     # Run with specific model
+    python -m dino_rl.play_browser --algo ppo --games 5 # Force PPO checkpoint
 """
 import argparse
-import os
 import time
-
-import torch
 
 from selenium import webdriver
 from selenium.common.exceptions import WebDriverException
 
-from dino_rl.networks import DuelingDQN
+from dino_rl.feature_contract import build_browser_state_js
+from dino_rl.policy_loader import load_policy
+from dino_rl.policy_paths import default_policy_path
 
 
-FEATURE_DIM = 8  # Includes current speed
-
-
-# JavaScript injected into the page to extract game state features.
-# Returns an object with 8 normalized features matching the training env,
-# plus crash/score/playing status.
-# Uses Runner.instance_ which we alias from Runner.getInstance() at setup
-# (Chrome 145+ no longer exposes Runner.instance_ directly).
-GET_STATE_JS = """
-return (function() {
-    var r = Runner.instance_;
-    if (!r || !r.tRex) return null;
-
-    var tRex = r.tRex;
-    var obstacles = r.horizon.obstacles;
-    var canvasWidth = r.dimensions.WIDTH || 600;
-    var maxSpeed = 13.0;
-
-    // Filter obstacles that are ahead of the dino AND at a jumpable height.
-    // High-flying pterodactyls (bottom edge above dino's head) can be run
-    // under safely, so we exclude them.
-    var dinoTop = tRex.groundYPos || 93;
-    var ahead = [];
-    for (var i = 0; i < obstacles.length; i++) {
-        var o = obstacles[i];
-        if (o.yPos + o.typeConfig.height <= dinoTop) continue;
-        if (o.xPos + o.width > tRex.xPos) {
-            ahead.push({x: o.xPos, w: o.width, h: o.typeConfig.height});
-        }
-    }
-    ahead.sort(function(a, b) { return a.x - b.x; });
-
-    // Feature 0-2: nearest obstacle distance, width, height
-    var dist1, w1, h1;
-    if (ahead.length >= 1) {
-        dist1 = (ahead[0].x - tRex.xPos) / canvasWidth;
-        w1 = ahead[0].w / 75.0;   // max: CACTUS_LARGE * 3 = 75
-        h1 = ahead[0].h / 50.0;
-    } else {
-        dist1 = 1.0; w1 = 0.0; h1 = 0.0;
-    }
-
-    // Feature 6: distance to 2nd nearest obstacle
-    var dist2 = (ahead.length >= 2) ?
-        (ahead[1].x - tRex.xPos) / canvasWidth : 1.0;
-
-    // Feature 3: dino height above ground (groundYPos = 93)
-    var groundY = tRex.groundYPos || 93;
-    var dinoHeight = Math.max(0, groundY - tRex.yPos) / 93.0;
-
-    // Feature 4: dino vertical velocity
-    var dinoVel = tRex.jumping ? (tRex.jumpVelocity / 12.0) : 0.0;
-
-    // Feature 5: is jumping
-    var jumping = tRex.jumping ? 1.0 : 0.0;
-
-    // Feature 7: current game speed (normalized by max speed)
-    var speed = r.currentSpeed / maxSpeed;
-
-    // Score
-    var scoreStr = r.distanceMeter.digits.join('');
-
-    return {
-        features: [dist1, w1, h1, dinoHeight, dinoVel, jumping, dist2, speed],
-        crashed: r.crashed,
-        score: parseInt(scoreStr) || 0,
-        playing: r.playing
-    };
-})();
-"""
-
-
-def load_model(weight_path):
-    """Load trained DuelingDQN model."""
-    device = torch.device("cpu")
-    model = DuelingDQN(FEATURE_DIM, 2).to(device)
-    checkpoint = torch.load(weight_path, map_location=device, weights_only=True)
-    model.load_state_dict(checkpoint['model'])
-    model.eval()
-    print(f"Loaded model from {weight_path}")
-    return model, device
-
-
-def get_action(model, device, features):
-    """Run inference to get best action."""
-    with torch.no_grad():
-        state = torch.FloatTensor(features).unsqueeze(0).to(device)
-        q_values = model(state)
-        return q_values.argmax(dim=1).item()
+GET_STATE_JS = build_browser_state_js()
 
 
 def setup_browser(headless=False):
@@ -143,7 +54,7 @@ def setup_browser(headless=False):
     return driver
 
 
-def play(driver, model, device, max_games=None):
+def play(driver, policy, max_games=None):
     """Main game loop: extract state, pick action, control via JS."""
 
     # Start the first game via JavaScript (works in both headed and headless)
@@ -153,7 +64,7 @@ def play(driver, model, device, max_games=None):
     time.sleep(0.3)
 
     print("=" * 60, flush=True)
-    print("  DQN Agent is playing Chrome Dino!", flush=True)
+    print(f"  {policy.algo.upper()} policy is playing Chrome Dino!", flush=True)
     print("  (with real acceleration - no cheats)", flush=True)
     print("  Press Ctrl+C to stop.", flush=True)
     print("=" * 60, flush=True)
@@ -198,7 +109,7 @@ def play(driver, model, device, max_games=None):
 
             # Get model's action and execute immediately
             features = state['features']
-            action = get_action(model, device, features)
+            action = policy.act(features)
             steps += 1
 
             if action == 1:
@@ -211,17 +122,26 @@ def play(driver, model, device, max_games=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Play Chrome Dino with trained DQN")
-    default_model = os.path.join(
-        os.path.dirname(__file__), '..', 'checkpoints', 'dino_runner.pth'
+    parser = argparse.ArgumentParser(
+        description="Play Chrome Dino with a trained DQN or PPO policy"
     )
     parser.add_argument(
-        "--model", default=default_model,
-        help="Path to trained model weights (default: checkpoints/dino_runner.pth)"
+        "--model", default=default_policy_path(),
+        help=(
+            "Path to trained model weights "
+            "(defaults to checkpoints/dino_ppo_best.pth when present, "
+            "otherwise checkpoints/dino_runner.pth)"
+        )
     )
     parser.add_argument(
         "--games", type=int, default=None,
         help="Number of games to play (default: unlimited)"
+    )
+    parser.add_argument(
+        "--algo",
+        choices=("auto", "dqn", "ppo"),
+        default="auto",
+        help="Checkpoint type (default: auto-detect from checkpoint contents)"
     )
     parser.add_argument(
         "--headless", action="store_true",
@@ -229,11 +149,12 @@ def main():
     )
     args = parser.parse_args()
 
-    model, device = load_model(args.model)
+    policy = load_policy(args.model, algo=args.algo, device='cpu')
+    print(f"Loaded {policy.algo.upper()} policy from {args.model}")
     driver = setup_browser(headless=args.headless)
 
     try:
-        play(driver, model, device, max_games=args.games)
+        play(driver, policy, max_games=args.games)
     finally:
         driver.quit()
         print("Browser closed.")

@@ -13,6 +13,14 @@ Domain randomization (optional, for sim-to-real transfer):
 import numpy as np
 import cv2
 
+from dino_rl.feature_contract import (
+    GROUND_Y_POS,
+    MAX_ABS_JUMP_VELOCITY,
+    MAX_GAME_SPEED,
+    MAX_OBSTACLE_HEIGHT,
+    MAX_OBSTACLE_WIDTH,
+)
+
 
 class ActionSpace:
     """Minimal replacement for gym.spaces.Discrete."""
@@ -412,18 +420,18 @@ class DinoRunEnv:
 
         if ahead:
             dist1 = (ahead[0].x - self.dino_x) / self.GAME_WIDTH
-            w1 = ahead[0].width / 75.0
-            h1 = ahead[0].height / 50.0
+            w1 = ahead[0].width / MAX_OBSTACLE_WIDTH
+            h1 = ahead[0].height / MAX_OBSTACLE_HEIGHT
         else:
             dist1, w1, h1 = 1.0, 0.0, 0.0
 
         dist2 = ((ahead[1].x - self.dino_x) / self.GAME_WIDTH
                  if len(ahead) >= 2 else 1.0)
 
-        dino_height = (self.ground_y_pos - self.dino_y) / 93.0
-        dino_vel = self.jump_velocity / 12.0
+        dino_height = (self.ground_y_pos - self.dino_y) / GROUND_Y_POS
+        dino_vel = self.jump_velocity / MAX_ABS_JUMP_VELOCITY
         jumping = 1.0 if self.jumping else 0.0
-        spd = self.speed / self.MAX_SPEED
+        spd = self.speed / MAX_GAME_SPEED
 
         features = np.array(
             [dist1, w1, h1, dino_height, dino_vel, jumping, dist2, spd],

@@ -1,0 +1,10 @@
+commit	eval_avg	eval_max	status	description
+c5a00ad	1427.5	2208	keep	baseline current PPO settings (rollout=40000, shared 256x256x128 net)
+19d2d52	191.2	354	discard	physics-informed derived features plus running observation normalization
+8625ed3	33.9	70	discard	cheap timing features with shorter rollout, lower entropy, and orthogonal tanh actor-critic
+236cada	653.6	1105	discard	greater sample reuse with lower entropy and larger minibatches
+c05a167	2140.1	5331	keep	baseline PPO plus small score-delta reward shaping
+8a3a530	411.9	951	discard	stronger score-delta shaping coefficient 0.05
+8cf2345	45.9	125	discard	lower entropy bonus on top of score-delta shaping
+a46f936	1914.8	4132	discard	higher learning rate 0.0004 on top of score-delta shaping
+d28f2f5	568.2	952	discard	higher learning rate with tighter clipping on top of score-delta shaping

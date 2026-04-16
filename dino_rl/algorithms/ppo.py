@@ -225,6 +225,7 @@ from dino_rl.common import (
     ACTION_SIZE,
     RESULTS_DIR,
 )
+from dino_rl.policy_paths import PPO_BEST_CHECKPOINT_PATH, PPO_LAST_CHECKPOINT_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +262,32 @@ ENTROPY_COEFF = 0.01
 VALUE_COEFF = 0.5
 TARGET_EVAL_SCORE = 10000
 SCORE_DELTA_COEFF = 0.02
+
+
+def save_checkpoint(
+    path: str,
+    model: nn.Module,
+    optimizer: optim.Optimizer | None = None,
+    *,
+    update: int | None = None,
+    eval_result: dict | None = None,
+):
+    """Persist a PPO policy so it can be replayed later in sim or browser."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {
+        'algo': 'ppo',
+        'feature_dim': FEATURE_DIM,
+        'action_size': ACTION_SIZE,
+        'model_state_dict': model.state_dict(),
+        'score_delta_coeff': SCORE_DELTA_COEFF,
+    }
+    if optimizer is not None:
+        payload['optimizer_state_dict'] = optimizer.state_dict()
+    if update is not None:
+        payload['update'] = update
+    if eval_result is not None:
+        payload['eval_result'] = eval_result
+    torch.save(payload, path)
 
 
 # ---------------------------------------------------------------------------
@@ -813,6 +840,7 @@ def train(
     all_episode_scores: list[int] = []
     eval_history: list[tuple[int, float]] = []  # (update_num, avg_score)
     total_steps = 0
+    best_eval_avg = float('-inf')
 
     # Initial state
     state = env.reset()
@@ -902,6 +930,20 @@ def train(
                 f"max={eval_result['max']}"
             )
 
+            if eval_result['avg'] > best_eval_avg:
+                best_eval_avg = eval_result['avg']
+                save_checkpoint(
+                    PPO_BEST_CHECKPOINT_PATH,
+                    model,
+                    optimizer,
+                    update=update,
+                    eval_result=eval_result,
+                )
+                print(
+                    f"  >> Saved new best PPO checkpoint: "
+                    f"{PPO_BEST_CHECKPOINT_PATH}"
+                )
+
             if eval_result['avg'] >= TARGET_EVAL_SCORE:
                 print(f"\n*** TARGET REACHED! Eval avg: {eval_result['avg']:.1f} >= {TARGET_EVAL_SCORE} ***")
                 break
@@ -931,6 +973,23 @@ def train(
         f"Final eval: avg={final_eval['avg']:.1f}  "
         f"min={final_eval['min']}  max={final_eval['max']}"
     )
+    save_checkpoint(
+        PPO_LAST_CHECKPOINT_PATH,
+        model,
+        optimizer,
+        update=update,
+        eval_result=final_eval,
+    )
+    print(f"Saved final PPO checkpoint: {PPO_LAST_CHECKPOINT_PATH}")
+    if final_eval['avg'] > best_eval_avg:
+        save_checkpoint(
+            PPO_BEST_CHECKPOINT_PATH,
+            model,
+            optimizer,
+            update=update,
+            eval_result=final_eval,
+        )
+        print(f"Updated best PPO checkpoint: {PPO_BEST_CHECKPOINT_PATH}")
 
     writer.close()
     save_results('ppo', all_episode_scores, eval_result=final_eval)

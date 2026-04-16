@@ -26,20 +26,18 @@ import torch.nn as nn
 import torch.optim as optim
 
 from dino_rl.env import DinoRunEnv
+from dino_rl.feature_contract import FEATURE_DIM
 from dino_rl.networks import DuelingDQN
+from dino_rl.policy_paths import DQN_CHECKPOINT_PATH
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-FEATURE_DIM = 8  # Number of features from env.get_features() (includes speed)
-
 
 class Agent:
     def __init__(self, action_size: int, continue_training: bool = False):
-        self.weight_backup = os.path.join(
-            os.path.dirname(__file__), '..', 'checkpoints', 'dino_runner.pth'
-        )
+        self.weight_backup = DQN_CHECKPOINT_PATH
         self.action_size = action_size
         self.memory = deque(maxlen=200000)
         self.epsilon = 1.0
@@ -80,6 +78,9 @@ class Agent:
 
     def save_model(self):
         torch.save({
+            'algo': 'dqn',
+            'feature_dim': FEATURE_DIM,
+            'action_size': self.action_size,
             'model': self.model.state_dict(),
             'target_model': self.target_model.state_dict(),
             'optimizer': self.optimizer.state_dict(),

@@ -138,6 +138,45 @@ tensorboard --logdir results/runs
 # Then open http://localhost:6006
 ```
 
+### PPO Autoresearch Notes (Apr 2026)
+
+The best 30-minute PPO variant so far keeps the baseline hyperparameters and
+adds a small score-progress reward bonus inside `dino_rl/algorithms/ppo.py`:
+
+```python
+score_delta = max(info['score'] - prev_score, 0)
+reward = reward + 0.02 * score_delta
+```
+
+Two smaller cleanups shipped with it:
+- `scheduler.step()` now runs after the PPO optimizer update
+- rollout tensors use `torch.as_tensor(...)` instead of rebuilding tensors
+
+This was the first PPO change that clearly beat the old baseline under the
+same 30-minute wall-clock budget:
+
+| PPO Run | Final Eval Avg | Final Eval Max | Notes |
+|---|---|---|---|
+| Baseline PPO | 1427.5 | 2208 | No score-progress shaping |
+| Best PPO autoresearch run | 2140.1 | 5331 | `score_delta_coeff = 0.02` |
+
+What to watch in TensorBoard for PPO:
+
+| Metric | Winning-run pattern | Warning sign |
+|---|---|---|
+| `eval/avg_score` | Final arbiter; best run finished at 2140.1 | Training looks better, but eval stays flat or regresses |
+| `train/avg_score` | Roughly 39.4 by update 10 | Stuck in low 30s after several updates |
+| `train/entropy` | Stayed around 0.64 at update 10 | Early entropy collapse or manually forcing it lower hurt final eval |
+| `train/clip_fraction` | Around 0.016 on the winning run | Sustained values above ~0.04 often preceded worse final results |
+| `train/approx_kl` | Roughly 0.003 to 0.004 | Large spikes imply overly aggressive updates |
+| `train/value_loss` | Fell to about 0.45 by update 10 | Large noisy swings usually came with weaker eval |
+
+What this means in practice:
+- Gate PPO changes on `eval/avg_score`, not just `train/avg_score`
+- Treat `clip_fraction` and `approx_kl` as stability checks, not the target
+- The best PPO run still looked active at the 30-minute cutoff, so longer
+  training is probably somewhat helpful, but only for a stable config
+
 ---
 
 ## 4. Metrics to Track

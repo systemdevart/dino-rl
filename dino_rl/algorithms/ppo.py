@@ -294,6 +294,7 @@ def save_checkpoint(
     env_backend: str = "sim",
     observation_mode: str = "feature",
     state_shape: tuple[int, ...] | None = None,
+    score_delta_coeff: float = SCORE_DELTA_COEFF,
 ):
     """Persist a PPO policy so it can be replayed later in sim or browser."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -304,7 +305,7 @@ def save_checkpoint(
         "env_backend": env_backend,
         "observation_mode": observation_mode,
         "model_state_dict": model.state_dict(),
-        "score_delta_coeff": SCORE_DELTA_COEFF,
+        "score_delta_coeff": score_delta_coeff,
     }
     if hasattr(model, "state_dim"):
         payload["feature_dim"] = getattr(model, "state_dim")
@@ -1009,6 +1010,7 @@ def collect_rollout(
     buffer: RolloutBuffer,
     state: np.ndarray,
     device: str,
+    score_delta_coeff: float,
 ):
     """
     Collect T steps of experience using the current policy.
@@ -1049,7 +1051,7 @@ def collect_rollout(
         next_state, reward, done, info = env.step(action.item())
         score_delta = max(info["score"] - prev_score, 0)
         prev_score = info["score"]
-        reward = reward + SCORE_DELTA_COEFF * score_delta
+        reward = reward + score_delta_coeff * score_delta
         next_state_t = torch.as_tensor(next_state, dtype=torch.float32, device=device)
 
         # Store the transition.
@@ -1114,6 +1116,11 @@ def train(
     algo_name: str | None = None,
     use_future_aux: bool | None = None,
     future_aux_coeff: float = FUTURE_AUX_COEFF,
+    lr: float = LR,
+    clip_eps: float = CLIP_EPS,
+    entropy_coeff: float = ENTROPY_COEFF,
+    value_coeff: float = VALUE_COEFF,
+    score_delta_coeff: float = SCORE_DELTA_COEFF,
 ):
     """
     Train a policy using PPO on the Dino game.
@@ -1191,15 +1198,15 @@ def train(
         observation_mode,
     )
 
-    print(f"PPO  |  device={device}  lr={LR}  clip_eps={CLIP_EPS}")
+    print(f"PPO  |  device={device}  lr={lr}  clip_eps={clip_eps}")
     print(
         f"       env_backend={env_backend}  obs_mode={observation_mode}  "
         f"eval_backend={eval_env_backend}  eval_obs_mode={eval_observation_mode}"
     )
     print(f"       gamma={GAMMA}  lam_gae={LAM_GAE}  epochs={ppo_epochs}")
     print(f"       rollout_len={rollout_len}  minibatch={minibatch_size}")
-    print(f"       entropy_coeff={ENTROPY_COEFF}  value_coeff={VALUE_COEFF}")
-    print(f"       score_delta_coeff={SCORE_DELTA_COEFF}")
+    print(f"       entropy_coeff={entropy_coeff}  value_coeff={value_coeff}")
+    print(f"       score_delta_coeff={score_delta_coeff}")
     print(f"       future_aux={use_future_aux}  future_aux_coeff={future_aux_coeff}")
     print(
         f"       total steps = {n_updates} * {rollout_len} = {n_updates * rollout_len}"
@@ -1210,9 +1217,10 @@ def train(
     state = env.reset()
     state_shape = tuple(state.shape)
     model = make_model(observation_mode, state_shape, ACTION_SIZE).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=LR, eps=1e-5)
+    optimizer = optim.Adam(model.parameters(), lr=lr, eps=1e-5)
+    loaded_checkpoint = None
     if init_checkpoint_path is not None:
-        checkpoint = load_checkpoint(
+        loaded_checkpoint = load_checkpoint(
             init_checkpoint_path,
             model,
             optimizer,
@@ -1220,8 +1228,8 @@ def train(
         )
         print(
             f"Loaded PPO checkpoint from {init_checkpoint_path} "
-            f"(update={checkpoint.get('update', 'n/a')}, "
-            f"saved_eval={checkpoint.get('eval_result', {}).get('avg', 'n/a')})"
+            f"(update={loaded_checkpoint.get('update', 'n/a')}, "
+            f"saved_eval={loaded_checkpoint.get('eval_result', {}).get('avg', 'n/a')})"
         )
 
     # Linear LR annealing: decay from LR to 0 over n_updates
@@ -1240,6 +1248,11 @@ def train(
     eval_history: list[tuple[int, float]] = []  # (update_num, avg_score)
     total_steps = 0
     best_eval_avg = float("-inf")
+    if loaded_checkpoint is not None:
+        best_eval_avg = loaded_checkpoint.get("eval_result", {}).get(
+            "avg",
+            best_eval_avg,
+        )
 
     train_start = time.time()
 
@@ -1249,7 +1262,14 @@ def train(
     for update in range(1, n_updates + 1):
         # ---- 1. Collect rollout --------------------------------------
         model.eval()
-        state, episode_scores = collect_rollout(env, model, buffer, state, device)
+        state, episode_scores = collect_rollout(
+            env,
+            model,
+            buffer,
+            state,
+            device,
+            score_delta_coeff,
+        )
         model.train()
 
         total_steps += rollout_len
@@ -1260,11 +1280,11 @@ def train(
             model=model,
             optimizer=optimizer,
             buffer=buffer,
-            clip_eps=CLIP_EPS,
+            clip_eps=clip_eps,
             ppo_epochs=ppo_epochs,
             minibatch_size=minibatch_size,
-            entropy_coeff=ENTROPY_COEFF,
-            value_coeff=VALUE_COEFF,
+            entropy_coeff=entropy_coeff,
+            value_coeff=value_coeff,
             future_aux_coeff=future_aux_coeff,
         )
 
@@ -1355,6 +1375,7 @@ def train(
                     env_backend=env_backend,
                     observation_mode=observation_mode,
                     state_shape=state_shape,
+                    score_delta_coeff=score_delta_coeff,
                 )
                 print(f"  >> Saved new best PPO checkpoint: " f"{best_ckpt_path}")
 
@@ -1408,6 +1429,7 @@ def train(
         env_backend=env_backend,
         observation_mode=observation_mode,
         state_shape=state_shape,
+        score_delta_coeff=score_delta_coeff,
     )
     print(f"Saved final PPO checkpoint: {last_ckpt_path}")
     if final_eval["avg"] > best_eval_avg:
@@ -1420,6 +1442,7 @@ def train(
             env_backend=env_backend,
             observation_mode=observation_mode,
             state_shape=state_shape,
+            score_delta_coeff=score_delta_coeff,
         )
         print(f"Updated best PPO checkpoint: {best_ckpt_path}")
 
@@ -1542,6 +1565,36 @@ if __name__ == "__main__":
         default=FUTURE_AUX_COEFF,
         help="Weight for the auxiliary future-state loss",
     )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=LR,
+        help="Adam learning rate",
+    )
+    parser.add_argument(
+        "--clip-eps",
+        type=float,
+        default=CLIP_EPS,
+        help="PPO clipping epsilon",
+    )
+    parser.add_argument(
+        "--entropy-coeff",
+        type=float,
+        default=ENTROPY_COEFF,
+        help="Entropy bonus coefficient",
+    )
+    parser.add_argument(
+        "--value-coeff",
+        type=float,
+        default=VALUE_COEFF,
+        help="Value loss coefficient",
+    )
+    parser.add_argument(
+        "--score-delta-coeff",
+        type=float,
+        default=SCORE_DELTA_COEFF,
+        help="Reward shaping multiplier for score gains",
+    )
     args = parser.parse_args()
 
     browser_kwargs = {
@@ -1591,4 +1644,9 @@ if __name__ == "__main__":
         target_eval_score=args.target_eval_score,
         use_future_aux=not args.disable_future_aux,
         future_aux_coeff=args.future_aux_coeff,
+        lr=args.lr,
+        clip_eps=args.clip_eps,
+        entropy_coeff=args.entropy_coeff,
+        value_coeff=args.value_coeff,
+        score_delta_coeff=args.score_delta_coeff,
     )

@@ -207,11 +207,13 @@ each piece of experience K times (typically K=4 epochs).
         4.  Discard the rollout data (on-policy: old data is now stale)
 """
 
+import argparse
 import os
 import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
 
@@ -225,8 +227,7 @@ from dino_rl.common import (
     ACTION_SIZE,
     RESULTS_DIR,
 )
-from dino_rl.policy_paths import PPO_BEST_CHECKPOINT_PATH, PPO_LAST_CHECKPOINT_PATH
-
+from dino_rl.policy_paths import get_ppo_checkpoint_paths
 
 # ---------------------------------------------------------------------------
 # Hyperparameters
@@ -256,12 +257,24 @@ CLIP_EPS = 0.2
 GAMMA = 0.99
 LAM_GAE = 0.95
 PPO_EPOCHS = 10
-ROLLOUT_LEN = 40000   # Must be > 32,600 frames needed for score 10k
+ROLLOUT_LEN = 40000  # Must be > 32,600 frames needed for score 10k
 MINIBATCH_SIZE = 512
 ENTROPY_COEFF = 0.01
 VALUE_COEFF = 0.5
 TARGET_EVAL_SCORE = 10000
 SCORE_DELTA_COEFF = 0.02
+LATENT_DIM = 128
+FUTURE_AUX_COEFF = 0.1
+FUTURE_REWARD_COEFF = 0.25
+FUTURE_DONE_COEFF = 0.25
+
+# Browser-backed PPO needs shorter rollouts because every environment step is
+# a Selenium round-trip instead of an in-process Python function call.
+BROWSER_ROLLOUT_LEN = 4096
+BROWSER_PPO_EPOCHS = 4
+BROWSER_MINIBATCH_SIZE = 256
+BROWSER_EVAL_EPISODES = 5
+BROWSER_EVAL_MAX_STEPS = 50000
 
 
 def save_checkpoint(
@@ -275,34 +288,53 @@ def save_checkpoint(
     """Persist a PPO policy so it can be replayed later in sim or browser."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {
-        'algo': 'ppo',
-        'feature_dim': FEATURE_DIM,
-        'action_size': ACTION_SIZE,
-        'model_state_dict': model.state_dict(),
-        'score_delta_coeff': SCORE_DELTA_COEFF,
+        "algo": "ppo",
+        "feature_dim": FEATURE_DIM,
+        "action_size": ACTION_SIZE,
+        "latent_dim": getattr(model, "latent_dim", LATENT_DIM),
+        "model_state_dict": model.state_dict(),
+        "score_delta_coeff": SCORE_DELTA_COEFF,
     }
     if optimizer is not None:
-        payload['optimizer_state_dict'] = optimizer.state_dict()
+        payload["optimizer_state_dict"] = optimizer.state_dict()
     if update is not None:
-        payload['update'] = update
+        payload["update"] = update
     if eval_result is not None:
-        payload['eval_result'] = eval_result
+        payload["eval_result"] = eval_result
     torch.save(payload, path)
+
+
+def load_checkpoint(
+    path: str,
+    model: nn.Module,
+    optimizer: optim.Optimizer | None = None,
+    *,
+    load_optimizer: bool = False,
+):
+    """Load PPO weights, optionally restoring the optimizer state too."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    if load_optimizer and optimizer is not None:
+        opt_state = checkpoint.get("optimizer_state_dict")
+        if opt_state is not None:
+            optimizer.load_state_dict(opt_state)
+    return checkpoint
 
 
 # ---------------------------------------------------------------------------
 # Actor-Critic Network
 # ---------------------------------------------------------------------------
 
+
 class ActorCritic(nn.Module):
     """
     Shared-backbone actor-critic network for PPO.
 
     Architecture:
-        state (FEATURE_DIM=8)
+        state (FEATURE_DIM=10)
             -> Linear(128) -> ReLU
             -> Linear(128) -> ReLU          <-- shared backbone
-            +--> Linear(ACTION_SIZE=2)      <-- policy head (actor)
+            +--> Linear(ACTION_SIZE=3)      <-- policy head (actor)
             +--> Linear(1)                  <-- value head (critic)
 
     The shared backbone learns a general state representation.  The two heads
@@ -320,8 +352,11 @@ class ActorCritic(nn.Module):
       networks are sometimes used to avoid interference.
     """
 
-    def __init__(self, state_dim: int, action_dim: int):
+    def __init__(self, state_dim: int, action_dim: int, latent_dim: int = LATENT_DIM):
         super().__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.latent_dim = latent_dim
 
         # Shared backbone -- three hidden layers with ReLU activation.
         self.backbone = nn.Sequential(
@@ -329,17 +364,40 @@ class ActorCritic(nn.Module):
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(256, 128),
+            nn.Linear(256, latent_dim),
             nn.ReLU(),
         )
 
         # Policy head (actor): outputs raw logits for each action.
         # We do NOT apply softmax here; torch.distributions.Categorical
         # handles log-softmax internally for numerical stability.
-        self.policy_head = nn.Linear(128, action_dim)
+        self.policy_head = nn.Linear(latent_dim, action_dim)
 
         # Value head (critic): outputs a single scalar V(s).
-        self.value_head = nn.Linear(128, 1)
+        self.value_head = nn.Linear(latent_dim, 1)
+
+        # Auxiliary transition model: predict the next latent state, immediate
+        # reward, and termination flag from the current latent plus action.
+        self.future_head = nn.Sequential(
+            nn.Linear(latent_dim + action_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, latent_dim + 2),
+        )
+
+    def encode(self, x: torch.Tensor):
+        """Encode a state into a compact latent representation."""
+        return self.backbone(x)
+
+    def predict_transition(self, states: torch.Tensor, actions: torch.Tensor):
+        """Predict next latent, reward, and done from current latent and action."""
+        latent = self.encode(states)
+        action_1h = F.one_hot(actions, num_classes=self.action_dim).float()
+        transition_in = torch.cat([latent, action_1h], dim=-1)
+        transition_out = self.future_head(transition_in)
+        pred_next_latent = transition_out[..., : self.latent_dim]
+        pred_reward = transition_out[..., self.latent_dim]
+        pred_done_logit = transition_out[..., self.latent_dim + 1]
+        return pred_next_latent, pred_reward, pred_done_logit
 
     def forward(self, x: torch.Tensor):
         """
@@ -352,7 +410,7 @@ class ActorCritic(nn.Module):
             logits: action logits of shape (batch, action_dim) or (action_dim,)
             value:  state value of shape (batch, 1) or (1,)
         """
-        features = self.backbone(x)
+        features = self.encode(x)
         logits = self.policy_head(features)
         value = self.value_head(features)
         return logits, value
@@ -399,6 +457,7 @@ class ActorCritic(nn.Module):
 # Rollout Buffer
 # ---------------------------------------------------------------------------
 
+
 class RolloutBuffer:
     """
     Fixed-size buffer for storing a single rollout of T steps.
@@ -425,6 +484,7 @@ class RolloutBuffer:
 
         # Pre-allocate tensors for efficiency.
         self.states = torch.zeros(rollout_len, state_dim, device=device)
+        self.next_states = torch.zeros(rollout_len, state_dim, device=device)
         self.actions = torch.zeros(rollout_len, dtype=torch.long, device=device)
         self.rewards = torch.zeros(rollout_len, device=device)
         self.dones = torch.zeros(rollout_len, device=device)
@@ -435,10 +495,11 @@ class RolloutBuffer:
         self.advantages = torch.zeros(rollout_len, device=device)
         self.returns = torch.zeros(rollout_len, device=device)
 
-    def store(self, state, action, reward, done, log_prob, value):
+    def store(self, state, next_state, action, reward, done, log_prob, value):
         """Store one transition at the current pointer position."""
         idx = self.ptr
         self.states[idx] = state
+        self.next_states[idx] = next_state
         self.actions[idx] = action
         self.rewards[idx] = reward
         self.dones[idx] = float(done)
@@ -527,6 +588,7 @@ class RolloutBuffer:
 # PPO Update
 # ---------------------------------------------------------------------------
 
+
 def ppo_update(
     model: ActorCritic,
     optimizer: optim.Optimizer,
@@ -536,6 +598,7 @@ def ppo_update(
     minibatch_size: int,
     entropy_coeff: float,
     value_coeff: float,
+    future_aux_coeff: float = 0.0,
 ):
     """
     Perform the PPO parameter update given a filled rollout buffer.
@@ -585,6 +648,10 @@ def ppo_update(
     total_policy_loss = 0.0
     total_value_loss = 0.0
     total_entropy = 0.0
+    total_future_loss = 0.0
+    total_future_latent_loss = 0.0
+    total_future_reward_loss = 0.0
+    total_future_done_loss = 0.0
     total_clip_frac = 0.0
     total_approx_kl = 0.0
     total_ratio_mean = 0.0
@@ -600,6 +667,7 @@ def ppo_update(
         for batch_idx in buffer.get_minibatches(minibatch_size):
             # ---- Gather minibatch data -----------------------------------
             mb_states = buffer.states[batch_idx]
+            mb_next_states = buffer.next_states[batch_idx]
             mb_actions = buffer.actions[batch_idx]
             mb_old_log_probs = buffer.log_probs[batch_idx]
             mb_advantages = advantages[batch_idx]
@@ -645,11 +713,39 @@ def ppo_update(
             # -entropy_coeff * mean(entropy) to encourage higher entropy).
             entropy_loss = -torch.mean(entropy)
 
+            future_latent_loss = torch.zeros((), device=mb_states.device)
+            future_reward_loss = torch.zeros((), device=mb_states.device)
+            future_done_loss = torch.zeros((), device=mb_states.device)
+            if future_aux_coeff > 0.0:
+                pred_next_latent, pred_reward, pred_done_logit = (
+                    model.predict_transition(mb_states, mb_actions)
+                )
+                with torch.no_grad():
+                    target_next_latent = model.encode(mb_next_states)
+                future_latent_loss = torch.mean(
+                    (pred_next_latent - target_next_latent) ** 2
+                )
+                future_reward_loss = torch.mean(
+                    (pred_reward - buffer.rewards[batch_idx]) ** 2
+                )
+                future_done_loss = F.binary_cross_entropy_with_logits(
+                    pred_done_logit,
+                    buffer.dones[batch_idx],
+                )
+                future_loss = (
+                    future_latent_loss
+                    + FUTURE_REWARD_COEFF * future_reward_loss
+                    + FUTURE_DONE_COEFF * future_done_loss
+                )
+            else:
+                future_loss = torch.zeros((), device=mb_states.device)
+
             # ---- Total loss and gradient step ----------------------------
             loss = (
                 policy_loss
                 + value_coeff * value_loss
                 + entropy_coeff * entropy_loss
+                + future_aux_coeff * future_loss
             )
 
             optimizer.zero_grad()
@@ -672,11 +768,15 @@ def ppo_update(
                 # Approx KL divergence between old and new policy.
                 # KL ≈ 0.5 * mean((log_ratio)^2)  (second-order approx)
                 # If KL > 0.05, policy is diverging too fast.
-                approx_kl = (0.5 * (log_ratio ** 2)).mean().item()
+                approx_kl = (0.5 * (log_ratio**2)).mean().item()
 
             total_policy_loss += policy_loss.item()
             total_value_loss += value_loss.item()
             total_entropy += -entropy_loss.item()  # flip sign for readability
+            total_future_loss += future_loss.item()
+            total_future_latent_loss += future_latent_loss.item()
+            total_future_reward_loss += future_reward_loss.item()
+            total_future_done_loss += future_done_loss.item()
             total_clip_frac += clipped
             total_approx_kl += approx_kl
             total_ratio_mean += ratio.mean().item()
@@ -684,21 +784,26 @@ def ppo_update(
 
     n = max(n_updates, 1)
     return {
-        'policy_loss': total_policy_loss / n,
-        'value_loss': total_value_loss / n,
-        'entropy': total_entropy / n,
-        'clip_frac': total_clip_frac / n,
-        'approx_kl': total_approx_kl / n,
-        'ratio_mean': total_ratio_mean / n,
-        'adv_mean': raw_adv_mean,
-        'adv_std': raw_adv_std,
-        'grad_norm': grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
+        "policy_loss": total_policy_loss / n,
+        "value_loss": total_value_loss / n,
+        "entropy": total_entropy / n,
+        "future_loss": total_future_loss / n,
+        "future_latent_loss": total_future_latent_loss / n,
+        "future_reward_loss": total_future_reward_loss / n,
+        "future_done_loss": total_future_done_loss / n,
+        "clip_frac": total_clip_frac / n,
+        "approx_kl": total_approx_kl / n,
+        "ratio_mean": total_ratio_mean / n,
+        "adv_mean": raw_adv_mean,
+        "adv_std": raw_adv_std,
+        "grad_norm": grad_norm.item() if hasattr(grad_norm, "item") else grad_norm,
     }
 
 
 # ---------------------------------------------------------------------------
 # Rollout collection
 # ---------------------------------------------------------------------------
+
 
 @torch.no_grad()
 def collect_rollout(
@@ -745,13 +850,15 @@ def collect_rollout(
 
         # Take the action in the environment.
         next_state, reward, done, info = env.step(action.item())
-        score_delta = max(info['score'] - prev_score, 0)
-        prev_score = info['score']
+        score_delta = max(info["score"] - prev_score, 0)
+        prev_score = info["score"]
         reward = reward + SCORE_DELTA_COEFF * score_delta
+        next_state_t = torch.as_tensor(next_state, dtype=torch.float32, device=device)
 
         # Store the transition.
         buffer.store(
             state=state_t,
+            next_state=next_state_t,
             action=action,
             reward=reward,
             done=done,
@@ -761,7 +868,7 @@ def collect_rollout(
 
         if done:
             # Episode ended.  Record the score and reset.
-            episode_scores.append(info['score'])
+            episode_scores.append(info["score"])
             state = env.reset()
             prev_score = env.get_score()
         else:
@@ -784,6 +891,7 @@ def collect_rollout(
 # Training loop
 # ---------------------------------------------------------------------------
 
+
 def train(
     n_updates: int = 100,
     device: str | None = None,
@@ -791,6 +899,22 @@ def train(
     print_every: int = 1,
     writer=None,
     time_budget_sec: float | None = None,
+    *,
+    env_backend: str = "sim",
+    env_kwargs: dict | None = None,
+    eval_env_backend: str | None = None,
+    eval_env_kwargs: dict | None = None,
+    rollout_len: int | None = None,
+    ppo_epochs: int | None = None,
+    minibatch_size: int | None = None,
+    eval_episodes: int | None = None,
+    eval_max_steps: int | None = None,
+    init_checkpoint_path: str | None = None,
+    load_optimizer_state: bool = False,
+    target_eval_score: int = TARGET_EVAL_SCORE,
+    algo_name: str | None = None,
+    use_future_aux: bool | None = None,
+    future_aux_coeff: float = FUTURE_AUX_COEFF,
 ):
     """
     Train a policy using PPO on the Dino game.
@@ -812,35 +936,80 @@ def train(
     # Setup
     # ------------------------------------------------------------------
     if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if eval_env_backend is None:
+        eval_env_backend = env_backend
+    env_kwargs = dict(env_kwargs or {})
+    eval_env_kwargs = dict(eval_env_kwargs or env_kwargs)
+
+    if rollout_len is None:
+        rollout_len = BROWSER_ROLLOUT_LEN if env_backend == "browser" else ROLLOUT_LEN
+    if ppo_epochs is None:
+        ppo_epochs = BROWSER_PPO_EPOCHS if env_backend == "browser" else PPO_EPOCHS
+    if minibatch_size is None:
+        minibatch_size = (
+            BROWSER_MINIBATCH_SIZE if env_backend == "browser" else MINIBATCH_SIZE
+        )
+    if eval_episodes is None:
+        eval_episodes = BROWSER_EVAL_EPISODES if eval_env_backend == "browser" else 20
+    if eval_max_steps is None:
+        eval_max_steps = (
+            BROWSER_EVAL_MAX_STEPS if eval_env_backend == "browser" else 50000
+        )
+    if algo_name is None:
+        algo_name = "ppo" if env_backend == "sim" else f"ppo_{env_backend}"
+    if use_future_aux is None:
+        use_future_aux = env_backend == "browser"
+    if not use_future_aux:
+        future_aux_coeff = 0.0
+
+    best_ckpt_path, last_ckpt_path = get_ppo_checkpoint_paths(env_backend)
 
     print(f"PPO  |  device={device}  lr={LR}  clip_eps={CLIP_EPS}")
-    print(f"       gamma={GAMMA}  lam_gae={LAM_GAE}  epochs={PPO_EPOCHS}")
-    print(f"       rollout_len={ROLLOUT_LEN}  minibatch={MINIBATCH_SIZE}")
+    print(f"       env_backend={env_backend}  eval_backend={eval_env_backend}")
+    print(f"       gamma={GAMMA}  lam_gae={LAM_GAE}  epochs={ppo_epochs}")
+    print(f"       rollout_len={rollout_len}  minibatch={minibatch_size}")
     print(f"       entropy_coeff={ENTROPY_COEFF}  value_coeff={VALUE_COEFF}")
     print(f"       score_delta_coeff={SCORE_DELTA_COEFF}")
-    print(f"       total steps = {n_updates} * {ROLLOUT_LEN} = {n_updates * ROLLOUT_LEN}")
+    print(f"       future_aux={use_future_aux}  future_aux_coeff={future_aux_coeff}")
+    print(
+        f"       total steps = {n_updates} * {rollout_len} = {n_updates * rollout_len}"
+    )
     print()
 
-    env = DinoFeatureEnv()
+    env = DinoFeatureEnv(env_backend=env_backend, **env_kwargs)
     model = ActorCritic(FEATURE_DIM, ACTION_SIZE).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LR, eps=1e-5)
+    if init_checkpoint_path is not None:
+        checkpoint = load_checkpoint(
+            init_checkpoint_path,
+            model,
+            optimizer,
+            load_optimizer=load_optimizer_state,
+        )
+        print(
+            f"Loaded PPO checkpoint from {init_checkpoint_path} "
+            f"(update={checkpoint.get('update', 'n/a')}, "
+            f"saved_eval={checkpoint.get('eval_result', {}).get('avg', 'n/a')})"
+        )
 
     # Linear LR annealing: decay from LR to 0 over n_updates
     def lr_lambda(update):
         return 1.0 - update / n_updates
+
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    buffer = RolloutBuffer(ROLLOUT_LEN, FEATURE_DIM, device)
+    buffer = RolloutBuffer(rollout_len, FEATURE_DIM, device)
 
     if writer is None:
-        writer = create_writer('ppo')
+        writer = create_writer(algo_name)
 
     # Tracking
     all_episode_scores: list[int] = []
     eval_history: list[tuple[int, float]] = []  # (update_num, avg_score)
     total_steps = 0
-    best_eval_avg = float('-inf')
+    best_eval_avg = float("-inf")
 
     # Initial state
     state = env.reset()
@@ -852,12 +1021,10 @@ def train(
     for update in range(1, n_updates + 1):
         # ---- 1. Collect rollout --------------------------------------
         model.eval()
-        state, episode_scores = collect_rollout(
-            env, model, buffer, state, device
-        )
+        state, episode_scores = collect_rollout(env, model, buffer, state, device)
         model.train()
 
-        total_steps += ROLLOUT_LEN
+        total_steps += rollout_len
         all_episode_scores.extend(episode_scores)
 
         # ---- 2. PPO parameter update ---------------------------------
@@ -866,10 +1033,11 @@ def train(
             optimizer=optimizer,
             buffer=buffer,
             clip_eps=CLIP_EPS,
-            ppo_epochs=PPO_EPOCHS,
-            minibatch_size=MINIBATCH_SIZE,
+            ppo_epochs=ppo_epochs,
+            minibatch_size=minibatch_size,
             entropy_coeff=ENTROPY_COEFF,
             value_coeff=VALUE_COEFF,
+            future_aux_coeff=future_aux_coeff,
         )
 
         # ---- 3. Anneal learning rate ---------------------------------
@@ -885,7 +1053,7 @@ def train(
                 avg_score = 0.0
                 n_eps = 0
 
-            cur_lr = optimizer.param_groups[0]['lr']
+            cur_lr = optimizer.param_groups[0]["lr"]
             print(
                 f"Update {update:4d}/{n_updates} | "
                 f"Steps {total_steps:7d} | "
@@ -897,32 +1065,49 @@ def train(
                 f"KL {metrics['approx_kl']:.5f} | "
                 f"Clip {metrics['clip_frac']:.3f}"
             )
-            writer.add_scalar('train/policy_loss', metrics['policy_loss'], update)
-            writer.add_scalar('train/value_loss', metrics['value_loss'], update)
-            writer.add_scalar('train/entropy', metrics['entropy'], update)
-            writer.add_scalar('train/avg_score', avg_score, update)
-            writer.add_scalar('train/clip_fraction', metrics['clip_frac'], update)
-            writer.add_scalar('train/approx_kl', metrics['approx_kl'], update)
-            writer.add_scalar('train/ratio_mean', metrics['ratio_mean'], update)
-            writer.add_scalar('train/advantage_mean', metrics['adv_mean'], update)
-            writer.add_scalar('train/advantage_std', metrics['adv_std'], update)
-            writer.add_scalar('train/grad_norm', metrics['grad_norm'], update)
-            writer.add_scalar('train/learning_rate', cur_lr, update)
+            writer.add_scalar("train/policy_loss", metrics["policy_loss"], update)
+            writer.add_scalar("train/value_loss", metrics["value_loss"], update)
+            writer.add_scalar("train/entropy", metrics["entropy"], update)
+            writer.add_scalar("train/avg_score", avg_score, update)
+            writer.add_scalar("train/clip_fraction", metrics["clip_frac"], update)
+            writer.add_scalar("train/approx_kl", metrics["approx_kl"], update)
+            writer.add_scalar("train/ratio_mean", metrics["ratio_mean"], update)
+            writer.add_scalar("train/advantage_mean", metrics["adv_mean"], update)
+            writer.add_scalar("train/advantage_std", metrics["adv_std"], update)
+            writer.add_scalar("train/grad_norm", metrics["grad_norm"], update)
+            writer.add_scalar("train/learning_rate", cur_lr, update)
+            writer.add_scalar("train/future_loss", metrics["future_loss"], update)
+            writer.add_scalar(
+                "train/future_latent_loss", metrics["future_latent_loss"], update
+            )
+            writer.add_scalar(
+                "train/future_reward_loss", metrics["future_reward_loss"], update
+            )
+            writer.add_scalar(
+                "train/future_done_loss", metrics["future_done_loss"], update
+            )
             if episode_scores:
-                writer.add_scalar('train/max_score', max(episode_scores), update)
-                writer.add_scalar('train/min_score', min(episode_scores), update)
+                writer.add_scalar("train/max_score", max(episode_scores), update)
+                writer.add_scalar("train/min_score", min(episode_scores), update)
 
         # ---- 5. Periodic evaluation ----------------------------------
         if update % eval_every == 0:
+
             @torch.no_grad()
             def policy_fn(s, _model=model, _device=device):
                 s_t = torch.as_tensor(s, dtype=torch.float32, device=_device)
                 logits, _ = _model(s_t)
                 return logits.argmax().item()
 
-            eval_result = evaluate(policy_fn)
-            eval_history.append((len(all_episode_scores), eval_result['avg']))
-            writer.add_scalar('eval/avg_score', eval_result['avg'], update)
+            eval_result = evaluate(
+                policy_fn,
+                n_episodes=eval_episodes,
+                max_steps=eval_max_steps,
+                env_backend=eval_env_backend,
+                env_kwargs=eval_env_kwargs,
+            )
+            eval_history.append((len(all_episode_scores), eval_result["avg"]))
+            writer.add_scalar("eval/avg_score", eval_result["avg"], update)
             print(
                 f"  >> Eval @ update {update}: "
                 f"avg={eval_result['avg']:.1f}  "
@@ -930,29 +1115,31 @@ def train(
                 f"max={eval_result['max']}"
             )
 
-            if eval_result['avg'] > best_eval_avg:
-                best_eval_avg = eval_result['avg']
+            if eval_result["avg"] > best_eval_avg:
+                best_eval_avg = eval_result["avg"]
                 save_checkpoint(
-                    PPO_BEST_CHECKPOINT_PATH,
+                    best_ckpt_path,
                     model,
                     optimizer,
                     update=update,
                     eval_result=eval_result,
                 )
-                print(
-                    f"  >> Saved new best PPO checkpoint: "
-                    f"{PPO_BEST_CHECKPOINT_PATH}"
-                )
+                print(f"  >> Saved new best PPO checkpoint: " f"{best_ckpt_path}")
 
-            if eval_result['avg'] >= TARGET_EVAL_SCORE:
-                print(f"\n*** TARGET REACHED! Eval avg: {eval_result['avg']:.1f} >= {TARGET_EVAL_SCORE} ***")
+            if eval_result["avg"] >= target_eval_score:
+                print(
+                    f"\n*** TARGET REACHED! Eval avg: {eval_result['avg']:.1f} "
+                    f">= {target_eval_score} ***"
+                )
                 break
 
         # ---- 6. Time budget check ------------------------------------
         elapsed = time.time() - train_start
         if time_budget_sec is not None and elapsed >= time_budget_sec:
-            print(f"\n*** TIME BUDGET ({time_budget_sec:.0f}s) reached at update {update} "
-                  f"({elapsed:.1f}s elapsed) ***")
+            print(
+                f"\n*** TIME BUDGET ({time_budget_sec:.0f}s) reached at update {update} "
+                f"({elapsed:.1f}s elapsed) ***"
+            )
             break
 
     # ------------------------------------------------------------------
@@ -968,35 +1155,42 @@ def train(
         logits, _ = model(s_t)
         return logits.argmax().item()
 
-    final_eval = evaluate(final_policy_fn)
+    final_eval = evaluate(
+        final_policy_fn,
+        n_episodes=eval_episodes,
+        max_steps=eval_max_steps,
+        env_backend=eval_env_backend,
+        env_kwargs=eval_env_kwargs,
+    )
     print(
         f"Final eval: avg={final_eval['avg']:.1f}  "
         f"min={final_eval['min']}  max={final_eval['max']}"
     )
     save_checkpoint(
-        PPO_LAST_CHECKPOINT_PATH,
+        last_ckpt_path,
         model,
         optimizer,
         update=update,
         eval_result=final_eval,
     )
-    print(f"Saved final PPO checkpoint: {PPO_LAST_CHECKPOINT_PATH}")
-    if final_eval['avg'] > best_eval_avg:
+    print(f"Saved final PPO checkpoint: {last_ckpt_path}")
+    if final_eval["avg"] > best_eval_avg:
         save_checkpoint(
-            PPO_BEST_CHECKPOINT_PATH,
+            best_ckpt_path,
             model,
             optimizer,
             update=update,
             eval_result=final_eval,
         )
-        print(f"Updated best PPO checkpoint: {PPO_BEST_CHECKPOINT_PATH}")
+        print(f"Updated best PPO checkpoint: {best_ckpt_path}")
 
     writer.close()
-    save_results('ppo', all_episode_scores, eval_result=final_eval)
+    env.close()
+    save_results(algo_name, all_episode_scores, eval_result=final_eval)
     plot_training(
         all_episode_scores,
-        title='PPO (Proximal Policy Optimization)',
-        path=os.path.join(RESULTS_DIR, 'ppo.png'),
+        title=f"PPO (Proximal Policy Optimization) [{env_backend}]",
+        path=os.path.join(RESULTS_DIR, f"{algo_name}.png"),
         eval_scores=eval_history,
     )
 
@@ -1007,5 +1201,121 @@ def train(
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == '__main__':
-    train()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train PPO on Chrome Dino")
+    parser.add_argument(
+        "--env-backend",
+        choices=("sim", "browser"),
+        default="sim",
+        help="Environment backend to train on",
+    )
+    parser.add_argument(
+        "--eval-backend",
+        choices=("sim", "browser"),
+        default=None,
+        help="Environment backend to evaluate on (default: same as train)",
+    )
+    parser.add_argument(
+        "--time-budget-sec",
+        type=float,
+        default=None,
+        help="Wall-clock budget in seconds",
+    )
+    parser.add_argument(
+        "--n-updates", type=int, default=100, help="Maximum PPO update iterations"
+    )
+    parser.add_argument(
+        "--eval-every", type=int, default=10, help="Evaluate every N updates"
+    )
+    parser.add_argument(
+        "--print-every", type=int, default=1, help="Print progress every N updates"
+    )
+    parser.add_argument(
+        "--rollout-len", type=int, default=None, help="Rollout length override"
+    )
+    parser.add_argument(
+        "--ppo-epochs", type=int, default=None, help="PPO epochs override"
+    )
+    parser.add_argument(
+        "--minibatch-size", type=int, default=None, help="Minibatch size override"
+    )
+    parser.add_argument(
+        "--eval-episodes", type=int, default=None, help="Evaluation episodes override"
+    )
+    parser.add_argument(
+        "--eval-max-steps", type=int, default=None, help="Evaluation max-steps override"
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help="Initialize PPO weights from a checkpoint",
+    )
+    parser.add_argument(
+        "--load-optimizer-state",
+        action="store_true",
+        help="Also restore optimizer state from init checkpoint",
+    )
+    parser.add_argument(
+        "--browser-url", default="chrome://dino", help="Browser backend page URL"
+    )
+    parser.add_argument(
+        "--show-browser",
+        action="store_true",
+        help="Show the Chrome window instead of running headless",
+    )
+    parser.add_argument(
+        "--browser-accelerate",
+        action="store_true",
+        help="Use the real Dino acceleration in browser backend",
+    )
+    parser.add_argument(
+        "--target-eval-score",
+        type=int,
+        default=TARGET_EVAL_SCORE,
+        help="Stop early once deterministic eval reaches this score",
+    )
+    parser.add_argument(
+        "--disable-future-aux",
+        action="store_true",
+        help="Disable the auxiliary future-state model",
+    )
+    parser.add_argument(
+        "--future-aux-coeff",
+        type=float,
+        default=FUTURE_AUX_COEFF,
+        help="Weight for the auxiliary future-state loss",
+    )
+    args = parser.parse_args()
+
+    browser_kwargs = {
+        "browser_headless": not args.show_browser,
+        "browser_accelerate": args.browser_accelerate,
+        "browser_url": args.browser_url,
+    }
+    train_kwargs = {}
+    eval_kwargs = {}
+    if args.env_backend == "browser":
+        train_kwargs.update(browser_kwargs)
+    if (args.eval_backend or args.env_backend) == "browser":
+        eval_kwargs.update(browser_kwargs)
+
+    train(
+        n_updates=args.n_updates,
+        eval_every=args.eval_every,
+        print_every=args.print_every,
+        time_budget_sec=args.time_budget_sec,
+        env_backend=args.env_backend,
+        env_kwargs=train_kwargs,
+        eval_env_backend=args.eval_backend,
+        eval_env_kwargs=eval_kwargs,
+        rollout_len=args.rollout_len,
+        ppo_epochs=args.ppo_epochs,
+        minibatch_size=args.minibatch_size,
+        eval_episodes=args.eval_episodes,
+        eval_max_steps=args.eval_max_steps,
+        init_checkpoint_path=args.init_checkpoint,
+        load_optimizer_state=args.load_optimizer_state,
+        target_eval_score=args.target_eval_score,
+        use_future_aux=not args.disable_future_aux,
+        future_aux_coeff=args.future_aux_coeff,
+    )

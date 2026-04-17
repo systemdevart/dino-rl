@@ -10,10 +10,12 @@ Source: chromium/src/components/neterror/resources/offline.js
 Domain randomization (optional, for sim-to-real transfer):
 - Randomised dino X position: [20, 55] per episode
 """
+
 import numpy as np
 import cv2
 
 from dino_rl.feature_contract import (
+    GAME_HEIGHT,
     GROUND_Y_POS,
     MAX_ABS_JUMP_VELOCITY,
     MAX_GAME_SPEED,
@@ -24,6 +26,7 @@ from dino_rl.feature_contract import (
 
 class ActionSpace:
     """Minimal replacement for gym.spaces.Discrete."""
+
     def __init__(self, n):
         self.n = n
 
@@ -35,8 +38,9 @@ class ActionSpace:
 # Collision box (matches CollisionBox in offline.js)
 # ---------------------------------------------------------------------------
 
+
 class CollisionBox:
-    __slots__ = ('x', 'y', 'width', 'height')
+    __slots__ = ("x", "y", "width", "height")
 
     def __init__(self, x, y, w, h):
         self.x = x
@@ -50,14 +54,14 @@ class CollisionBox:
 # ---------------------------------------------------------------------------
 
 CACTUS_SMALL = {
-    'type': 'CACTUS_SMALL',
-    'width': 17,
-    'height': 35,
-    'yPos': 105,
-    'multipleSpeed': 4,
-    'minGap': 120,
-    'minSpeed': 0,
-    'collisionBoxes': [
+    "type": "CACTUS_SMALL",
+    "width": 17,
+    "height": 35,
+    "yPos": 105,
+    "multipleSpeed": 4,
+    "minGap": 120,
+    "minSpeed": 0,
+    "collisionBoxes": [
         CollisionBox(0, 7, 5, 27),
         CollisionBox(4, 0, 6, 34),
         CollisionBox(10, 4, 7, 14),
@@ -65,14 +69,14 @@ CACTUS_SMALL = {
 }
 
 CACTUS_LARGE = {
-    'type': 'CACTUS_LARGE',
-    'width': 25,
-    'height': 50,
-    'yPos': 90,
-    'multipleSpeed': 7,
-    'minGap': 120,
-    'minSpeed': 0,
-    'collisionBoxes': [
+    "type": "CACTUS_LARGE",
+    "width": 25,
+    "height": 50,
+    "yPos": 90,
+    "multipleSpeed": 7,
+    "minGap": 120,
+    "minSpeed": 0,
+    "collisionBoxes": [
         CollisionBox(0, 12, 7, 38),
         CollisionBox(8, 0, 7, 49),
         CollisionBox(13, 10, 10, 38),
@@ -80,21 +84,21 @@ CACTUS_LARGE = {
 }
 
 PTERODACTYL = {
-    'type': 'PTERODACTYL',
-    'width': 46,
-    'height': 40,
-    'yPos': [100, 75, 50],
-    'multipleSpeed': 999,
-    'minSpeed': 8.5,
-    'minGap': 150,
-    'collisionBoxes': [
+    "type": "PTERODACTYL",
+    "width": 46,
+    "height": 40,
+    "yPos": [100, 75, 50],
+    "multipleSpeed": 999,
+    "minSpeed": 8.5,
+    "minGap": 150,
+    "collisionBoxes": [
         CollisionBox(15, 15, 16, 5),
         CollisionBox(18, 21, 24, 6),
         CollisionBox(2, 14, 4, 3),
         CollisionBox(6, 10, 4, 7),
         CollisionBox(10, 8, 6, 9),
     ],
-    'speedOffset': 0.8,
+    "speedOffset": 0.8,
 }
 
 OBSTACLE_TYPES = [CACTUS_SMALL, CACTUS_LARGE, PTERODACTYL]
@@ -108,41 +112,51 @@ TREX_RUNNING_BOXES = [
     CollisionBox(5, 30, 21, 4),
     CollisionBox(9, 34, 15, 4),
 ]
+TREX_DUCKING_BOXES = [
+    CollisionBox(1, 18, 55, 25),
+]
 
 
 # ---------------------------------------------------------------------------
 # Collision helpers — checkForCollision / boxCompare in offline.js
 # ---------------------------------------------------------------------------
 
+
 def _box_compare(a, b):
     """AABB intersection test."""
-    return (a.x < b.x + b.width and
-            a.x + a.width > b.x and
-            a.y < b.y + b.height and
-            a.y + a.height > b.y)
+    return (
+        a.x < b.x + b.width
+        and a.x + a.width > b.x
+        and a.y < b.y + b.height
+        and a.y + a.height > b.y
+    )
 
 
-def _check_collision(obs, dino_x, dino_y, dino_w, dino_h):
+def _check_collision(obs, dino_x, dino_y, dino_w, dino_h, dino_collision_boxes):
     """
     Two-phase collision detection.
 
     Phase 1: broad-phase outer bounding boxes (1 px border adjustment).
     Phase 2: narrow-phase per-part AABB with detailed collision boxes.
     """
-    dino_outer = CollisionBox(dino_x + 1, dino_y + 1,
-                              dino_w - 2, dino_h - 2)
-    obs_outer = CollisionBox(int(obs.x) + 1, obs.y + 1,
-                             obs.width - 2, obs.height - 2)
+    dino_outer = CollisionBox(dino_x + 1, dino_y + 1, dino_w - 2, dino_h - 2)
+    obs_outer = CollisionBox(int(obs.x) + 1, obs.y + 1, obs.width - 2, obs.height - 2)
 
     if _box_compare(dino_outer, obs_outer):
-        for dino_cb in TREX_RUNNING_BOXES:
+        for dino_cb in dino_collision_boxes:
             for obs_cb in obs.collision_boxes:
                 adj_dino = CollisionBox(
-                    dino_cb.x + dino_outer.x, dino_cb.y + dino_outer.y,
-                    dino_cb.width, dino_cb.height)
+                    dino_cb.x + dino_outer.x,
+                    dino_cb.y + dino_outer.y,
+                    dino_cb.width,
+                    dino_cb.height,
+                )
                 adj_obs = CollisionBox(
-                    obs_cb.x + obs_outer.x, obs_cb.y + obs_outer.y,
-                    obs_cb.width, obs_cb.height)
+                    obs_cb.x + obs_outer.x,
+                    obs_cb.y + obs_outer.y,
+                    obs_cb.width,
+                    obs_cb.height,
+                )
                 if _box_compare(adj_dino, adj_obs):
                     return True
     return False
@@ -152,10 +166,20 @@ def _check_collision(obs, dino_x, dino_y, dino_w, dino_h):
 # Single obstacle instance — Obstacle class in offline.js
 # ---------------------------------------------------------------------------
 
+
 class _Obstacle:
-    __slots__ = ('type_config', 'x', 'y', 'width', 'height', 'size',
-                 'speed_offset', 'collision_boxes', 'gap',
-                 'following_created')
+    __slots__ = (
+        "type_config",
+        "x",
+        "y",
+        "width",
+        "height",
+        "size",
+        "speed_offset",
+        "collision_boxes",
+        "gap",
+        "following_created",
+    )
 
     def __init__(self, type_config, speed, gap_coefficient):
         self.type_config = type_config
@@ -163,22 +187,22 @@ class _Obstacle:
 
         # Size: getRandomNum(1, Obstacle.MAX_OBSTACLE_LENGTH)  -> 1..3
         self.size = np.random.randint(1, 4)
-        if self.size > 1 and type_config['multipleSpeed'] > speed:
+        if self.size > 1 and type_config["multipleSpeed"] > speed:
             self.size = 1
 
-        self.width = type_config['width'] * self.size
-        self.height = type_config['height']
+        self.width = type_config["width"] * self.size
+        self.height = type_config["height"]
 
         # Y position (pterodactyl has variable heights)
-        y_pos = type_config['yPos']
+        y_pos = type_config["yPos"]
         if isinstance(y_pos, list):
             self.y = y_pos[np.random.randint(0, len(y_pos))]
         else:
             self.y = y_pos
 
         # Pterodactyl speed offset (+/-0.8)
-        if 'speedOffset' in type_config:
-            offset = type_config['speedOffset']
+        if "speedOffset" in type_config:
+            offset = type_config["speedOffset"]
             self.speed_offset = offset if np.random.random() > 0.5 else -offset
         else:
             self.speed_offset = 0.0
@@ -186,7 +210,7 @@ class _Obstacle:
         # Deep-copy collision boxes and adjust for multi-size obstacles
         self.collision_boxes = [
             CollisionBox(b.x, b.y, b.width, b.height)
-            for b in type_config['collisionBoxes']
+            for b in type_config["collisionBoxes"]
         ]
         if self.size > 1 and len(self.collision_boxes) >= 3:
             self.collision_boxes[1].width = (
@@ -194,14 +218,11 @@ class _Obstacle:
                 - self.collision_boxes[0].width
                 - self.collision_boxes[2].width
             )
-            self.collision_boxes[2].x = (
-                self.width - self.collision_boxes[2].width
-            )
+            self.collision_boxes[2].x = self.width - self.collision_boxes[2].width
 
         # Gap to next obstacle  (Obstacle.prototype.getGap)
-        min_gap = round(self.width * speed
-                        + type_config['minGap'] * gap_coefficient)
-        max_gap = round(min_gap * 1.5)       # MAX_GAP_COEFFICIENT = 1.5
+        min_gap = round(self.width * speed + type_config["minGap"] * gap_coefficient)
+        max_gap = round(min_gap * 1.5)  # MAX_GAP_COEFFICIENT = 1.5
         self.gap = np.random.randint(min_gap, max_gap + 1)
 
         self.x = 0.0  # positioned by the spawner
@@ -211,6 +232,7 @@ class _Obstacle:
 # Main environment
 # ---------------------------------------------------------------------------
 
+
 class DinoRunEnv:
     """
     Chrome Dinosaur Game — 1:1 with Chromium's T-Rex Runner.
@@ -218,6 +240,7 @@ class DinoRunEnv:
     Actions:
         0: Do nothing
         1: Jump
+        2: Duck / hold down
 
     Observations:
         (80, 80, 1) uint8 image
@@ -234,21 +257,23 @@ class DinoRunEnv:
     # -- Runner.config --
     ACCELERATION = 0.001
     BOTTOM_PAD = 10
-    CLEAR_TIME = 3000                   # ms before obstacles appear
+    CLEAR_TIME = 3000  # ms before obstacles appear
     GAP_COEFFICIENT = 0.6
     GRAVITY = 0.6
-    INITIAL_JUMP_VELOCITY = -10         # Trex.config.INIITAL_JUMP_VELOCITY
-    INITIAL_SPEED = 6.0                 # Runner.config.SPEED
-    MAX_SPEED = 13.0                    # Runner.config.MAX_SPEED
+    INITIAL_JUMP_VELOCITY = -10  # Trex.config.INIITAL_JUMP_VELOCITY
+    INITIAL_SPEED = 6.0  # Runner.config.SPEED
+    MAX_SPEED = 13.0  # Runner.config.MAX_SPEED
     MAX_OBSTACLE_DUPLICATION = 2
 
     # -- Trex.config --
     DINO_WIDTH = 44
+    DINO_DUCK_WIDTH = 59
     DINO_HEIGHT = 47
-    DINO_START_X = 50                   # Trex.config.START_X_POS
-    DROP_VELOCITY = -5                  # Trex.config.DROP_VELOCITY
-    MAX_JUMP_HEIGHT = 30                # yPos ceiling -> endJump()
-    MIN_JUMP_HEIGHT = 30                # threshold for reachedMinHeight
+    DINO_START_X = 50  # Trex.config.START_X_POS
+    DROP_VELOCITY = -5  # Trex.config.DROP_VELOCITY
+    SPEED_DROP_COEFFICIENT = 3
+    MAX_JUMP_HEIGHT = 30  # yPos ceiling -> endJump()
+    MIN_JUMP_HEIGHT = 30  # threshold for reachedMinHeight
 
     # -- DistanceMeter --
     SCORE_COEFFICIENT = 0.025
@@ -256,7 +281,7 @@ class DinoRunEnv:
     # -- Derived --
     FPS = 60
     MS_PER_FRAME = 1000.0 / 60.0
-    CLEAR_FRAMES = round(CLEAR_TIME / MS_PER_FRAME)   # ~180
+    CLEAR_FRAMES = round(CLEAR_TIME / MS_PER_FRAME)  # ~180
 
     # -- HorizonLine --
     HORIZON_YPOS = 127
@@ -265,17 +290,17 @@ class DinoRunEnv:
     CROP_WIDTH = 300
     OBS_SIZE = 80
 
-    def __init__(self, domain_randomization=False, feature_noise=0.0,
-                 skip_clear_time=False):
-        self.action_space = ActionSpace(2)
+    def __init__(
+        self, domain_randomization=False, feature_noise=0.0, skip_clear_time=False
+    ):
+        self.action_space = ActionSpace(3)
         self.reward_range = (-1, 0.1)
         self.domain_randomization = domain_randomization
         self.feature_noise = feature_noise
         self.skip_clear_time = skip_clear_time
 
         # groundYPos = HEIGHT - DINO_HEIGHT - BOTTOM_PAD  (= 93)
-        self.ground_y_pos = (self.GAME_HEIGHT - self.DINO_HEIGHT
-                             - self.BOTTOM_PAD)
+        self.ground_y_pos = self.GAME_HEIGHT - self.DINO_HEIGHT - self.BOTTOM_PAD
         # minJumpHeight yPos = groundYPos - MIN_JUMP_HEIGHT  (= 63)
         self.min_jump_height_y = self.ground_y_pos - self.MIN_JUMP_HEIGHT
 
@@ -286,6 +311,8 @@ class DinoRunEnv:
         self.dino_y = self.ground_y_pos
         self.jump_velocity = 0.0
         self.jumping = False
+        self.ducking = False
+        self.speed_drop = False
         self.reached_min_height = False
         self.speed = self.INITIAL_SPEED
         self.distance_ran = 0.0
@@ -321,28 +348,39 @@ class DinoRunEnv:
         if self.speed < self.MAX_SPEED:
             self.speed = min(self.speed + self.ACCELERATION, self.MAX_SPEED)
 
-        # --- jump (Trex.prototype.startJump) ---
+        duck_requested = action == 2
+
+        # --- action handling (jump / duck / speed drop) ---
         if action == 1 and not self.jumping:
             # Tweak jump velocity based on speed (like the real game)
-            self.jump_velocity = (self.INITIAL_JUMP_VELOCITY
-                                  - self.speed / 10.0)
+            self.jump_velocity = self.INITIAL_JUMP_VELOCITY - self.speed / 10.0
             self.jumping = True
+            self.ducking = False
+            self.speed_drop = False
             self.reached_min_height = False
+        elif duck_requested:
+            if self.jumping:
+                self.speed_drop = True
+                self.ducking = False
+            else:
+                self.ducking = True
+        elif not self.jumping:
+            self.ducking = False
 
         # --- update jump physics (Trex.prototype.updateJump) ---
         if self.jumping:
             # Position update uses Math.round (framesElapsed=1 at 60fps)
-            self.dino_y += round(self.jump_velocity)
+            fall_multiplier = self.SPEED_DROP_COEFFICIENT if self.speed_drop else 1
+            self.dino_y += round(self.jump_velocity * fall_multiplier)
             self.jump_velocity += self.GRAVITY
 
             # Check minJumpHeight threshold
-            if self.dino_y < self.min_jump_height_y:
+            if self.dino_y < self.min_jump_height_y or self.speed_drop:
                 self.reached_min_height = True
 
             # Check MAX_JUMP_HEIGHT -> endJump()
-            if self.dino_y < self.MAX_JUMP_HEIGHT:
-                if (self.reached_min_height
-                        and self.jump_velocity < self.DROP_VELOCITY):
+            if self.dino_y < self.MAX_JUMP_HEIGHT or self.speed_drop:
+                if self.reached_min_height and self.jump_velocity < self.DROP_VELOCITY:
                     self.jump_velocity = self.DROP_VELOCITY
 
             # Back on ground -> reset
@@ -350,7 +388,9 @@ class DinoRunEnv:
                 self.dino_y = self.ground_y_pos
                 self.jump_velocity = 0.0
                 self.jumping = False
+                self.speed_drop = False
                 self.reached_min_height = False
+                self.ducking = duck_requested
 
         # --- move obstacles (Obstacle.prototype.update) ---
         for obs in self.obstacles:
@@ -367,19 +407,30 @@ class DinoRunEnv:
         if has_obstacles:
             if self.obstacles:
                 last = self.obstacles[-1]
-                if (not last.following_created
-                        and last.x + last.width > 0          # isVisible
-                        and (last.x + last.width + last.gap
-                             < self.GAME_WIDTH)):
+                if (
+                    not last.following_created
+                    and last.x + last.width > 0  # isVisible
+                    and (last.x + last.width + last.gap < self.GAME_WIDTH)
+                ):
                     self._add_obstacle()
                     last.following_created = True
             else:
                 self._add_obstacle()
 
         # --- collision detection (checkForCollision) ---
+        dino_width = self.DINO_DUCK_WIDTH if self.ducking else self.DINO_WIDTH
+        dino_collision_boxes = (
+            TREX_DUCKING_BOXES if self.ducking else TREX_RUNNING_BOXES
+        )
         for obs in self.obstacles:
-            if _check_collision(obs, self.dino_x, self.dino_y,
-                                self.DINO_WIDTH, self.DINO_HEIGHT):
+            if _check_collision(
+                obs,
+                self.dino_x,
+                self.dino_y,
+                dino_width,
+                self.DINO_HEIGHT,
+                dino_collision_boxes,
+            ):
                 self.crashed = True
                 break
 
@@ -393,7 +444,7 @@ class DinoRunEnv:
 
     def get_features(self, add_noise=False):
         """
-        8-dim normalised feature vector for RL agents.
+        10-dim normalised feature vector for RL agents.
 
         Features:
             0: distance to nearest obstacle   (/ GAME_WIDTH)
@@ -404,6 +455,8 @@ class DinoRunEnv:
             5: is_jumping                      (0 or 1)
             6: distance to 2nd nearest obstacle (/ GAME_WIDTH)
             7: current speed                   (/ MAX_SPEED)
+            8: top Y of nearest obstacle       (/ GAME_HEIGHT)
+            9: is_ducking                      (0 or 1)
 
         High pterodactyls the dino can safely run under are filtered out.
         """
@@ -412,8 +465,10 @@ class DinoRunEnv:
             if obs.x + obs.width <= self.dino_x:
                 continue  # already passed
             # Skip high pterodactyls the dino can run under
-            if (obs.type_config['type'] == 'PTERODACTYL'
-                    and obs.y + obs.height <= self.ground_y_pos):
+            if (
+                obs.type_config["type"] == "PTERODACTYL"
+                and obs.y + obs.height <= self.ground_y_pos
+            ):
                 continue
             ahead.append(obs)
         ahead.sort(key=lambda o: o.x)
@@ -422,24 +477,38 @@ class DinoRunEnv:
             dist1 = (ahead[0].x - self.dino_x) / self.GAME_WIDTH
             w1 = ahead[0].width / MAX_OBSTACLE_WIDTH
             h1 = ahead[0].height / MAX_OBSTACLE_HEIGHT
+            y1 = ahead[0].y / GAME_HEIGHT
         else:
-            dist1, w1, h1 = 1.0, 0.0, 0.0
+            dist1, w1, h1, y1 = 1.0, 0.0, 0.0, 0.0
 
-        dist2 = ((ahead[1].x - self.dino_x) / self.GAME_WIDTH
-                 if len(ahead) >= 2 else 1.0)
+        dist2 = (ahead[1].x - self.dino_x) / self.GAME_WIDTH if len(ahead) >= 2 else 1.0
 
         dino_height = (self.ground_y_pos - self.dino_y) / GROUND_Y_POS
         dino_vel = self.jump_velocity / MAX_ABS_JUMP_VELOCITY
         jumping = 1.0 if self.jumping else 0.0
+        ducking = 1.0 if self.ducking else 0.0
         spd = self.speed / MAX_GAME_SPEED
 
         features = np.array(
-            [dist1, w1, h1, dino_height, dino_vel, jumping, dist2, spd],
-            dtype=np.float32)
+            [
+                dist1,
+                w1,
+                h1,
+                dino_height,
+                dino_vel,
+                jumping,
+                dist2,
+                spd,
+                y1,
+                ducking,
+            ],
+            dtype=np.float32,
+        )
 
         if add_noise and self.feature_noise > 0:
-            features += np.random.normal(
-                0, self.feature_noise, features.shape).astype(np.float32)
+            features += np.random.normal(0, self.feature_noise, features.shape).astype(
+                np.float32
+            )
 
         return features
 
@@ -460,20 +529,21 @@ class DinoRunEnv:
             idx = np.random.randint(0, len(OBSTACLE_TYPES))
             tc = OBSTACLE_TYPES[idx]
 
-            if self.speed < tc['minSpeed']:
+            if self.speed < tc["minSpeed"]:
                 continue
-            if self._duplicate_check(tc['type']):
+            if self._duplicate_check(tc["type"]):
                 continue
 
             obs = _Obstacle(tc, self.speed, self.GAP_COEFFICIENT)
             # New obstacle starts at WIDTH + typeConfig.width (off-screen)
-            obs.x = float(self.GAME_WIDTH + tc['width'])
+            obs.x = float(self.GAME_WIDTH + tc["width"])
             self.obstacles.append(obs)
 
-            self.obstacle_history.insert(0, tc['type'])
+            self.obstacle_history.insert(0, tc["type"])
             if len(self.obstacle_history) > self.MAX_OBSTACLE_DUPLICATION:
                 self.obstacle_history = self.obstacle_history[
-                    :self.MAX_OBSTACLE_DUPLICATION]
+                    : self.MAX_OBSTACLE_DUPLICATION
+                ]
             return
 
     def _duplicate_check(self, next_type):
@@ -488,27 +558,46 @@ class DinoRunEnv:
         canvas = np.zeros((self.GAME_HEIGHT, self.CROP_WIDTH), dtype=np.uint8)
 
         # Ground line (HorizonLine.dimensions.YPOS = 127)
-        cv2.line(canvas, (0, self.HORIZON_YPOS),
-                 (self.CROP_WIDTH, self.HORIZON_YPOS), 255, 1)
+        cv2.line(
+            canvas, (0, self.HORIZON_YPOS), (self.CROP_WIDTH, self.HORIZON_YPOS), 255, 1
+        )
 
         # Dinosaur
         dy = int(self.dino_y)
-        cv2.rectangle(canvas,
-                      (self.dino_x, dy),
-                      (self.dino_x + self.DINO_WIDTH,
-                       dy + self.DINO_HEIGHT),
-                      255, 2)
+        if self.ducking:
+            duck_box = TREX_DUCKING_BOXES[0]
+            cv2.rectangle(
+                canvas,
+                (self.dino_x, dy + duck_box.y),
+                (
+                    self.dino_x + self.DINO_DUCK_WIDTH,
+                    dy + duck_box.y + duck_box.height,
+                ),
+                255,
+                2,
+            )
+        else:
+            cv2.rectangle(
+                canvas,
+                (self.dino_x, dy),
+                (self.dino_x + self.DINO_WIDTH, dy + self.DINO_HEIGHT),
+                255,
+                2,
+            )
 
         # Obstacles
         for obs in self.obstacles:
             ox = int(obs.x)
             if -obs.width < ox < self.CROP_WIDTH:
-                cv2.rectangle(canvas,
-                              (max(0, ox), obs.y),
-                              (min(self.CROP_WIDTH, ox + obs.width),
-                               obs.y + obs.height),
-                              255, 2)
+                cv2.rectangle(
+                    canvas,
+                    (max(0, ox), obs.y),
+                    (min(self.CROP_WIDTH, ox + obs.width), obs.y + obs.height),
+                    255,
+                    2,
+                )
 
-        img = cv2.resize(canvas, (self.OBS_SIZE, self.OBS_SIZE),
-                         interpolation=cv2.INTER_AREA)
+        img = cv2.resize(
+            canvas, (self.OBS_SIZE, self.OBS_SIZE), interpolation=cv2.INTER_AREA
+        )
         return np.expand_dims(img, -1)

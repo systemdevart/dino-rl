@@ -8,6 +8,7 @@ Provides:
 - save_results(): persist JSON results for comparison
 - create_writer(): create TensorBoard SummaryWriter for an algorithm
 """
+
 import json
 import os
 import time
@@ -17,9 +18,39 @@ import numpy as np
 from dino_rl.env import DinoRunEnv
 from dino_rl.feature_contract import FEATURE_DIM
 
-ACTION_SIZE = 2    # 0: do nothing, 1: jump
-_PROJECT_ROOT = os.path.join(os.path.dirname(__file__), '..')
-RESULTS_DIR = os.path.join(_PROJECT_ROOT, 'results')
+ACTION_SIZE = 3  # 0: do nothing, 1: jump, 2: duck / hold down
+_PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
+RESULTS_DIR = os.path.join(_PROJECT_ROOT, "results")
+
+
+def make_feature_backend(
+    env_backend="sim",
+    *,
+    domain_randomization=False,
+    feature_noise=0.0,
+    skip_clear_time=True,
+    browser_headless=True,
+    browser_accelerate=False,
+    browser_url="chrome://dino",
+):
+    """Construct the requested feature environment backend."""
+    if env_backend == "sim":
+        return DinoRunEnv(
+            domain_randomization=domain_randomization,
+            feature_noise=feature_noise,
+            skip_clear_time=skip_clear_time,
+        )
+
+    if env_backend == "browser":
+        from dino_rl.browser_env import ChromeDinoFeatureEnv
+
+        return ChromeDinoFeatureEnv(
+            headless=browser_headless,
+            accelerate=browser_accelerate,
+            page_url=browser_url,
+        )
+
+    raise ValueError(f"Unsupported env backend '{env_backend}'.")
 
 
 class DinoFeatureEnv:
@@ -28,20 +59,38 @@ class DinoFeatureEnv:
 
     Usage:
         env = DinoFeatureEnv()
-        state = env.reset()           # np.array of shape (8,)
+        state = env.reset()           # np.array of shape (10,)
         state, reward, done, info = env.step(action)
     """
 
-    def __init__(self, domain_randomization=False, feature_noise=0.0):
-        self.env = DinoRunEnv(
+    def __init__(
+        self,
+        domain_randomization=False,
+        feature_noise=0.0,
+        *,
+        env_backend="sim",
+        skip_clear_time=True,
+        browser_headless=True,
+        browser_accelerate=False,
+        browser_url="chrome://dino",
+    ):
+        self.env_backend = env_backend
+        self.env = make_feature_backend(
+            env_backend,
             domain_randomization=domain_randomization,
             feature_noise=feature_noise,
-            skip_clear_time=True,
+            skip_clear_time=skip_clear_time,
+            browser_headless=browser_headless,
+            browser_accelerate=browser_accelerate,
+            browser_url=browser_url,
         )
         self.action_space = self.env.action_space
 
     def reset(self):
         """Reset environment, return feature state."""
+        if self.env_backend == "browser":
+            return self.env.reset()
+
         self.env.reset()
         return self.env.get_features()
 
@@ -63,19 +112,35 @@ class DinoFeatureEnv:
           REINFORCE-family methods unable to distinguish good from bad episodes.
         - Crash penalty: -10.0 (amplified from the env's default -1.0).
         """
-        _, reward, score, done = self.env.step(action)
-        state = self.env.get_features()
+        if self.env_backend == "browser":
+            state, reward, done, info = self.env.step(action)
+            score = info["score"]
+        else:
+            _, reward, score, done = self.env.step(action)
+            state = self.env.get_features()
         if done:
             reward = -10.0
         else:
             reward = 0.01
-        return state, reward, done, {'score': score}
+        return state, reward, done, {"score": score}
 
     def get_score(self):
         return self.env.get_score()
 
+    def close(self):
+        close = getattr(self.env, "close", None)
+        if callable(close):
+            close()
 
-def evaluate(policy_fn, n_episodes=20, max_steps=25000):
+
+def evaluate(
+    policy_fn,
+    n_episodes=20,
+    max_steps=25000,
+    *,
+    env_backend="sim",
+    env_kwargs=None,
+):
     """
     Evaluate a deterministic policy over n_episodes.
 
@@ -87,24 +152,31 @@ def evaluate(policy_fn, n_episodes=20, max_steps=25000):
     Returns:
         dict with 'avg', 'min', 'max', 'scores' keys
     """
-    env = DinoFeatureEnv(domain_randomization=False)
+    env_kwargs = dict(env_kwargs or {})
+    env = DinoFeatureEnv(
+        domain_randomization=False,
+        env_backend=env_backend,
+        **env_kwargs,
+    )
     scores = []
+    try:
+        for _ in range(n_episodes):
+            state = env.reset()
+            for _ in range(max_steps):
+                action = policy_fn(state)
+                state, reward, done, info = env.step(action)
+                if done:
+                    break
+            scores.append(info["score"])
 
-    for _ in range(n_episodes):
-        state = env.reset()
-        for _ in range(max_steps):
-            action = policy_fn(state)
-            state, reward, done, info = env.step(action)
-            if done:
-                break
-        scores.append(info['score'])
-
-    return {
-        'avg': float(np.mean(scores)),
-        'min': int(np.min(scores)),
-        'max': int(np.max(scores)),
-        'scores': scores,
-    }
+        return {
+            "avg": float(np.mean(scores)),
+            "min": int(np.min(scores)),
+            "max": int(np.max(scores)),
+            "scores": scores,
+        }
+    finally:
+        env.close()
 
 
 def plot_training(scores, title, path, eval_scores=None):
@@ -119,33 +191,34 @@ def plot_training(scores, title, path, eval_scores=None):
     """
     try:
         import matplotlib
-        matplotlib.use('Agg')
+
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
         print(f"[plot_training] matplotlib not available, skipping plot: {path}")
         return
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(scores, alpha=0.3, label='Episode score')
+    ax.plot(scores, alpha=0.3, label="Episode score")
 
     # Rolling average
     if len(scores) >= 50:
         window = min(100, len(scores) // 5)
-        rolling = np.convolve(scores, np.ones(window) / window, mode='valid')
-        ax.plot(range(window - 1, len(scores)), rolling, label=f'{window}-ep avg')
+        rolling = np.convolve(scores, np.ones(window) / window, mode="valid")
+        ax.plot(range(window - 1, len(scores)), rolling, label=f"{window}-ep avg")
 
     if eval_scores:
         eps, vals = zip(*eval_scores)
-        ax.plot(eps, vals, 'r-o', markersize=3, label='Eval avg')
+        ax.plot(eps, vals, "r-o", markersize=3, label="Eval avg")
 
-    ax.set_xlabel('Episode')
-    ax.set_ylabel('Score')
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Score")
     ax.set_title(title)
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-    fig.savefig(path, dpi=100, bbox_inches='tight')
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fig.savefig(path, dpi=100, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved training plot: {path}")
 
@@ -161,22 +234,22 @@ def save_results(algo_name, train_scores, eval_result=None):
     """
     os.makedirs(RESULTS_DIR, exist_ok=True)
     result = {
-        'algorithm': algo_name,
-        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'n_episodes': len(train_scores),
-        'train_scores': train_scores,
-        'train_avg': float(np.mean(train_scores[-100:])) if train_scores else 0,
+        "algorithm": algo_name,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "n_episodes": len(train_scores),
+        "train_scores": train_scores,
+        "train_avg": float(np.mean(train_scores[-100:])) if train_scores else 0,
     }
     if eval_result:
-        result['eval'] = eval_result
+        result["eval"] = eval_result
 
-    path = os.path.join(RESULTS_DIR, f'{algo_name}.json')
-    with open(path, 'w') as f:
+    path = os.path.join(RESULTS_DIR, f"{algo_name}.json")
+    with open(path, "w") as f:
         json.dump(result, f, indent=2)
     print(f"Saved results: {path}")
 
 
-LOGS_DIR = os.path.join(RESULTS_DIR, 'runs')
+LOGS_DIR = os.path.join(RESULTS_DIR, "runs")
 
 
 def create_writer(algo_name):

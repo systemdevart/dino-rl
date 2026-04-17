@@ -275,6 +275,13 @@ BROWSER_PPO_EPOCHS = 4
 BROWSER_MINIBATCH_SIZE = 256
 BROWSER_EVAL_EPISODES = 5
 BROWSER_EVAL_MAX_STEPS = 50000
+BROWSER_IMAGE_SIZE = 84
+BROWSER_IMAGE_STACK = 4
+BROWSER_IMAGE_ROLLOUT_LEN = 2048
+BROWSER_IMAGE_PPO_EPOCHS = 4
+BROWSER_IMAGE_MINIBATCH_SIZE = 128
+BROWSER_IMAGE_EVAL_EPISODES = 3
+BROWSER_IMAGE_EVAL_MAX_STEPS = 25000
 
 
 def save_checkpoint(
@@ -284,17 +291,25 @@ def save_checkpoint(
     *,
     update: int | None = None,
     eval_result: dict | None = None,
+    env_backend: str = "sim",
+    observation_mode: str = "feature",
+    state_shape: tuple[int, ...] | None = None,
 ):
     """Persist a PPO policy so it can be replayed later in sim or browser."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {
         "algo": "ppo",
-        "feature_dim": FEATURE_DIM,
         "action_size": ACTION_SIZE,
         "latent_dim": getattr(model, "latent_dim", LATENT_DIM),
+        "env_backend": env_backend,
+        "observation_mode": observation_mode,
         "model_state_dict": model.state_dict(),
         "score_delta_coeff": SCORE_DELTA_COEFF,
     }
+    if hasattr(model, "state_dim"):
+        payload["feature_dim"] = getattr(model, "state_dim")
+    if state_shape is not None:
+        payload["state_shape"] = tuple(state_shape)
     if optimizer is not None:
         payload["optimizer_state_dict"] = optimizer.state_dict()
     if update is not None:
@@ -453,6 +468,85 @@ class ActorCritic(nn.Module):
         return log_probs, values.squeeze(-1), entropy
 
 
+class ImageActorCritic(nn.Module):
+    """CNN actor-critic that learns a latent embedding from stacked frames."""
+
+    def __init__(
+        self,
+        state_shape: tuple[int, int, int],
+        action_dim: int,
+        latent_dim: int = LATENT_DIM,
+    ):
+        super().__init__()
+        self.state_shape = tuple(state_shape)
+        self.action_dim = action_dim
+        self.latent_dim = latent_dim
+
+        channels, height, width = self.state_shape
+        self.encoder_cnn = nn.Sequential(
+            nn.Conv2d(channels, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, channels, height, width)
+            conv_dim = self.encoder_cnn(dummy).flatten(1).shape[1]
+
+        self.encoder_head = nn.Sequential(
+            nn.Linear(conv_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, latent_dim),
+            nn.ReLU(),
+        )
+        self.policy_head = nn.Linear(latent_dim, action_dim)
+        self.value_head = nn.Linear(latent_dim, 1)
+        self.future_head = nn.Sequential(
+            nn.Linear(latent_dim + action_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, latent_dim + 2),
+        )
+
+    def encode(self, x: torch.Tensor):
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
+        features = self.encoder_cnn(x)
+        features = features.flatten(1)
+        return self.encoder_head(features)
+
+    def predict_transition(self, states: torch.Tensor, actions: torch.Tensor):
+        latent = self.encode(states)
+        action_1h = F.one_hot(actions, num_classes=self.action_dim).float()
+        transition_in = torch.cat([latent, action_1h], dim=-1)
+        transition_out = self.future_head(transition_in)
+        pred_next_latent = transition_out[..., : self.latent_dim]
+        pred_reward = transition_out[..., self.latent_dim]
+        pred_done_logit = transition_out[..., self.latent_dim + 1]
+        return pred_next_latent, pred_reward, pred_done_logit
+
+    def forward(self, x: torch.Tensor):
+        features = self.encode(x)
+        logits = self.policy_head(features)
+        value = self.value_head(features)
+        return logits, value
+
+    def get_action_and_value(self, state: torch.Tensor):
+        logits, value = self.forward(state)
+        dist = Categorical(logits=logits)
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
+        return action, log_prob, value.squeeze(-1)
+
+    def evaluate_action(self, states: torch.Tensor, actions: torch.Tensor):
+        logits, values = self.forward(states)
+        dist = Categorical(logits=logits)
+        log_probs = dist.log_prob(actions)
+        entropy = dist.entropy()
+        return log_probs, values.squeeze(-1), entropy
+
+
 # ---------------------------------------------------------------------------
 # Rollout Buffer
 # ---------------------------------------------------------------------------
@@ -477,14 +571,22 @@ class RolloutBuffer:
     can be iterated over in random minibatches for the PPO update epochs.
     """
 
-    def __init__(self, rollout_len: int, state_dim: int, device: str):
+    def __init__(
+        self,
+        rollout_len: int,
+        state_shape: tuple[int, ...] | int,
+        device: str,
+    ):
         self.rollout_len = rollout_len
         self.device = device
         self.ptr = 0  # current write position
+        if isinstance(state_shape, int):
+            state_shape = (state_shape,)
+        self.state_shape = tuple(state_shape)
 
         # Pre-allocate tensors for efficiency.
-        self.states = torch.zeros(rollout_len, state_dim, device=device)
-        self.next_states = torch.zeros(rollout_len, state_dim, device=device)
+        self.states = torch.zeros((rollout_len, *self.state_shape), device=device)
+        self.next_states = torch.zeros((rollout_len, *self.state_shape), device=device)
         self.actions = torch.zeros(rollout_len, dtype=torch.long, device=device)
         self.rewards = torch.zeros(rollout_len, device=device)
         self.dones = torch.zeros(rollout_len, device=device)
@@ -590,7 +692,7 @@ class RolloutBuffer:
 
 
 def ppo_update(
-    model: ActorCritic,
+    model: nn.Module,
     optimizer: optim.Optimizer,
     buffer: RolloutBuffer,
     clip_eps: float,
@@ -801,14 +903,109 @@ def ppo_update(
 
 
 # ---------------------------------------------------------------------------
+# Environment / model helpers
+# ---------------------------------------------------------------------------
+
+
+def make_env(
+    env_backend: str,
+    observation_mode: str,
+    env_kwargs: dict | None = None,
+):
+    """Build the requested PPO environment."""
+    env_kwargs = dict(env_kwargs or {})
+    if observation_mode == "feature":
+        return DinoFeatureEnv(env_backend=env_backend, **env_kwargs)
+
+    if observation_mode != "image":
+        raise ValueError(f"Unsupported observation mode '{observation_mode}'.")
+    if env_backend != "browser":
+        raise ValueError(
+            "Image observations are currently only supported for browser backend."
+        )
+
+    from dino_rl.browser_env import ChromeDinoImageEnv
+
+    return ChromeDinoImageEnv(
+        headless=env_kwargs.get("browser_headless", True),
+        accelerate=env_kwargs.get("browser_accelerate", False),
+        page_url=env_kwargs.get("browser_url", "chrome://dino"),
+        obs_size=env_kwargs.get("image_size", BROWSER_IMAGE_SIZE),
+        frame_stack=env_kwargs.get("frame_stack", BROWSER_IMAGE_STACK),
+    )
+
+
+def make_model(
+    observation_mode: str,
+    state_shape: tuple[int, ...],
+    action_size: int,
+) -> nn.Module:
+    """Construct the PPO actor-critic for the chosen observation mode."""
+    if observation_mode == "feature":
+        if len(state_shape) != 1:
+            raise ValueError(f"Expected 1D feature state, got shape {state_shape}.")
+        return ActorCritic(state_shape[0], action_size)
+
+    if observation_mode == "image":
+        if len(state_shape) != 3:
+            raise ValueError(
+                f"Expected image state shape (C,H,W), got shape {state_shape}."
+            )
+        return ImageActorCritic(state_shape, action_size)
+
+    raise ValueError(f"Unsupported observation mode '{observation_mode}'.")
+
+
+def evaluate_policy(
+    policy_fn,
+    *,
+    observation_mode: str,
+    n_episodes: int,
+    max_steps: int,
+    env_backend: str,
+    env_kwargs: dict | None = None,
+):
+    """Evaluate a policy on feature or image observations."""
+    if observation_mode == "feature":
+        return evaluate(
+            policy_fn,
+            n_episodes=n_episodes,
+            max_steps=max_steps,
+            env_backend=env_backend,
+            env_kwargs=env_kwargs,
+        )
+
+    env = make_env(env_backend, observation_mode, env_kwargs)
+    scores = []
+    try:
+        for _ in range(n_episodes):
+            state = env.reset()
+            info = {"score": 0}
+            for _ in range(max_steps):
+                action = policy_fn(state)
+                state, _reward, done, info = env.step(action)
+                if done:
+                    break
+            scores.append(info["score"])
+        return {
+            "avg": float(np.mean(scores)),
+            "min": int(np.min(scores)),
+            "max": int(np.max(scores)),
+            "scores": scores,
+        }
+    finally:
+        env.close()
+
+
+# ---------------------------------------------------------------------------
 # Rollout collection
 # ---------------------------------------------------------------------------
 
 
 @torch.no_grad()
 def collect_rollout(
-    env: DinoFeatureEnv,
-    model: ActorCritic,
+    env,
+    model: nn.Module,
     buffer: RolloutBuffer,
     state: np.ndarray,
     device: str,
@@ -901,8 +1098,10 @@ def train(
     time_budget_sec: float | None = None,
     *,
     env_backend: str = "sim",
+    observation_mode: str = "feature",
     env_kwargs: dict | None = None,
     eval_env_backend: str | None = None,
+    eval_observation_mode: str | None = None,
     eval_env_kwargs: dict | None = None,
     rollout_len: int | None = None,
     ppo_epochs: int | None = None,
@@ -940,34 +1139,63 @@ def train(
 
     if eval_env_backend is None:
         eval_env_backend = env_backend
+    if eval_observation_mode is None:
+        eval_observation_mode = observation_mode
     env_kwargs = dict(env_kwargs or {})
     eval_env_kwargs = dict(eval_env_kwargs or env_kwargs)
 
     if rollout_len is None:
-        rollout_len = BROWSER_ROLLOUT_LEN if env_backend == "browser" else ROLLOUT_LEN
+        if observation_mode == "image":
+            rollout_len = BROWSER_IMAGE_ROLLOUT_LEN
+        else:
+            rollout_len = (
+                BROWSER_ROLLOUT_LEN if env_backend == "browser" else ROLLOUT_LEN
+            )
     if ppo_epochs is None:
-        ppo_epochs = BROWSER_PPO_EPOCHS if env_backend == "browser" else PPO_EPOCHS
+        if observation_mode == "image":
+            ppo_epochs = BROWSER_IMAGE_PPO_EPOCHS
+        else:
+            ppo_epochs = BROWSER_PPO_EPOCHS if env_backend == "browser" else PPO_EPOCHS
     if minibatch_size is None:
-        minibatch_size = (
-            BROWSER_MINIBATCH_SIZE if env_backend == "browser" else MINIBATCH_SIZE
-        )
+        if observation_mode == "image":
+            minibatch_size = BROWSER_IMAGE_MINIBATCH_SIZE
+        else:
+            minibatch_size = (
+                BROWSER_MINIBATCH_SIZE if env_backend == "browser" else MINIBATCH_SIZE
+            )
     if eval_episodes is None:
-        eval_episodes = BROWSER_EVAL_EPISODES if eval_env_backend == "browser" else 20
+        if eval_observation_mode == "image":
+            eval_episodes = BROWSER_IMAGE_EVAL_EPISODES
+        else:
+            eval_episodes = (
+                BROWSER_EVAL_EPISODES if eval_env_backend == "browser" else 20
+            )
     if eval_max_steps is None:
-        eval_max_steps = (
-            BROWSER_EVAL_MAX_STEPS if eval_env_backend == "browser" else 50000
-        )
+        if eval_observation_mode == "image":
+            eval_max_steps = BROWSER_IMAGE_EVAL_MAX_STEPS
+        else:
+            eval_max_steps = (
+                BROWSER_EVAL_MAX_STEPS if eval_env_backend == "browser" else 50000
+            )
     if algo_name is None:
         algo_name = "ppo" if env_backend == "sim" else f"ppo_{env_backend}"
+        if observation_mode != "feature":
+            algo_name = f"{algo_name}_{observation_mode}"
     if use_future_aux is None:
         use_future_aux = env_backend == "browser"
     if not use_future_aux:
         future_aux_coeff = 0.0
 
-    best_ckpt_path, last_ckpt_path = get_ppo_checkpoint_paths(env_backend)
+    best_ckpt_path, last_ckpt_path = get_ppo_checkpoint_paths(
+        env_backend,
+        observation_mode,
+    )
 
     print(f"PPO  |  device={device}  lr={LR}  clip_eps={CLIP_EPS}")
-    print(f"       env_backend={env_backend}  eval_backend={eval_env_backend}")
+    print(
+        f"       env_backend={env_backend}  obs_mode={observation_mode}  "
+        f"eval_backend={eval_env_backend}  eval_obs_mode={eval_observation_mode}"
+    )
     print(f"       gamma={GAMMA}  lam_gae={LAM_GAE}  epochs={ppo_epochs}")
     print(f"       rollout_len={rollout_len}  minibatch={minibatch_size}")
     print(f"       entropy_coeff={ENTROPY_COEFF}  value_coeff={VALUE_COEFF}")
@@ -978,8 +1206,10 @@ def train(
     )
     print()
 
-    env = DinoFeatureEnv(env_backend=env_backend, **env_kwargs)
-    model = ActorCritic(FEATURE_DIM, ACTION_SIZE).to(device)
+    env = make_env(env_backend, observation_mode, env_kwargs)
+    state = env.reset()
+    state_shape = tuple(state.shape)
+    model = make_model(observation_mode, state_shape, ACTION_SIZE).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LR, eps=1e-5)
     if init_checkpoint_path is not None:
         checkpoint = load_checkpoint(
@@ -1000,7 +1230,7 @@ def train(
 
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    buffer = RolloutBuffer(rollout_len, FEATURE_DIM, device)
+    buffer = RolloutBuffer(rollout_len, state_shape, device)
 
     if writer is None:
         writer = create_writer(algo_name)
@@ -1011,8 +1241,6 @@ def train(
     total_steps = 0
     best_eval_avg = float("-inf")
 
-    # Initial state
-    state = env.reset()
     train_start = time.time()
 
     # ------------------------------------------------------------------
@@ -1099,8 +1327,9 @@ def train(
                 logits, _ = _model(s_t)
                 return logits.argmax().item()
 
-            eval_result = evaluate(
+            eval_result = evaluate_policy(
                 policy_fn,
+                observation_mode=eval_observation_mode,
                 n_episodes=eval_episodes,
                 max_steps=eval_max_steps,
                 env_backend=eval_env_backend,
@@ -1123,6 +1352,9 @@ def train(
                     optimizer,
                     update=update,
                     eval_result=eval_result,
+                    env_backend=env_backend,
+                    observation_mode=observation_mode,
+                    state_shape=state_shape,
                 )
                 print(f"  >> Saved new best PPO checkpoint: " f"{best_ckpt_path}")
 
@@ -1155,8 +1387,9 @@ def train(
         logits, _ = model(s_t)
         return logits.argmax().item()
 
-    final_eval = evaluate(
+    final_eval = evaluate_policy(
         final_policy_fn,
+        observation_mode=eval_observation_mode,
         n_episodes=eval_episodes,
         max_steps=eval_max_steps,
         env_backend=eval_env_backend,
@@ -1172,6 +1405,9 @@ def train(
         optimizer,
         update=update,
         eval_result=final_eval,
+        env_backend=env_backend,
+        observation_mode=observation_mode,
+        state_shape=state_shape,
     )
     print(f"Saved final PPO checkpoint: {last_ckpt_path}")
     if final_eval["avg"] > best_eval_avg:
@@ -1181,6 +1417,9 @@ def train(
             optimizer,
             update=update,
             eval_result=final_eval,
+            env_backend=env_backend,
+            observation_mode=observation_mode,
+            state_shape=state_shape,
         )
         print(f"Updated best PPO checkpoint: {best_ckpt_path}")
 
@@ -1208,6 +1447,12 @@ if __name__ == "__main__":
         choices=("sim", "browser"),
         default="sim",
         help="Environment backend to train on",
+    )
+    parser.add_argument(
+        "--observation-mode",
+        choices=("feature", "image"),
+        default="feature",
+        help="Observation type for PPO",
     )
     parser.add_argument(
         "--eval-backend",
@@ -1269,6 +1514,18 @@ if __name__ == "__main__":
         help="Use the real Dino acceleration in browser backend",
     )
     parser.add_argument(
+        "--image-size",
+        type=int,
+        default=BROWSER_IMAGE_SIZE,
+        help="Image observation size for browser image mode",
+    )
+    parser.add_argument(
+        "--frame-stack",
+        type=int,
+        default=BROWSER_IMAGE_STACK,
+        help="Number of grayscale frames to stack for image mode",
+    )
+    parser.add_argument(
         "--target-eval-score",
         type=int,
         default=TARGET_EVAL_SCORE,
@@ -1296,8 +1553,22 @@ if __name__ == "__main__":
     eval_kwargs = {}
     if args.env_backend == "browser":
         train_kwargs.update(browser_kwargs)
+        if args.observation_mode == "image":
+            train_kwargs.update(
+                {
+                    "image_size": args.image_size,
+                    "frame_stack": args.frame_stack,
+                }
+            )
     if (args.eval_backend or args.env_backend) == "browser":
         eval_kwargs.update(browser_kwargs)
+        if args.observation_mode == "image":
+            eval_kwargs.update(
+                {
+                    "image_size": args.image_size,
+                    "frame_stack": args.frame_stack,
+                }
+            )
 
     train(
         n_updates=args.n_updates,
@@ -1305,8 +1576,10 @@ if __name__ == "__main__":
         print_every=args.print_every,
         time_budget_sec=args.time_budget_sec,
         env_backend=args.env_backend,
+        observation_mode=args.observation_mode,
         env_kwargs=train_kwargs,
         eval_env_backend=args.eval_backend,
+        eval_observation_mode=args.observation_mode,
         eval_env_kwargs=eval_kwargs,
         rollout_len=args.rollout_len,
         ppo_epochs=args.ppo_epochs,

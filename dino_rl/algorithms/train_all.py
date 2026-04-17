@@ -146,6 +146,12 @@ def main():
         help="PPO-only: environment backend",
     )
     parser.add_argument(
+        "--observation-mode",
+        choices=["feature", "image"],
+        default="feature",
+        help="PPO-only: observation type",
+    )
+    parser.add_argument(
         "--browser-url",
         default="chrome://dino",
         help="PPO-only: browser backend page URL",
@@ -159,6 +165,18 @@ def main():
         "--browser-accelerate",
         action="store_true",
         help="PPO-only: keep real Dino acceleration in browser backend",
+    )
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=84,
+        help="PPO-only: browser image observation size",
+    )
+    parser.add_argument(
+        "--frame-stack",
+        type=int,
+        default=4,
+        help="PPO-only: browser image frame stack depth",
     )
     parser.add_argument(
         "--init-checkpoint",
@@ -201,27 +219,30 @@ def main():
         t0 = time.time()
         try:
             if name == "ppo":
+                browser_env_kwargs = (
+                    {
+                        "browser_headless": not args.show_browser,
+                        "browser_accelerate": args.browser_accelerate,
+                        "browser_url": args.browser_url,
+                        **(
+                            {
+                                "image_size": args.image_size,
+                                "frame_stack": args.frame_stack,
+                            }
+                            if args.observation_mode == "image"
+                            else {}
+                        ),
+                    }
+                    if args.env_backend == "browser"
+                    else {}
+                )
                 ppo_kwargs = {
                     "env_backend": args.env_backend,
-                    "env_kwargs": (
-                        {
-                            "browser_headless": not args.show_browser,
-                            "browser_accelerate": args.browser_accelerate,
-                            "browser_url": args.browser_url,
-                        }
-                        if args.env_backend == "browser"
-                        else {}
-                    ),
+                    "observation_mode": args.observation_mode,
+                    "env_kwargs": browser_env_kwargs,
                     "eval_env_backend": args.env_backend,
-                    "eval_env_kwargs": (
-                        {
-                            "browser_headless": not args.show_browser,
-                            "browser_accelerate": args.browser_accelerate,
-                            "browser_url": args.browser_url,
-                        }
-                        if args.env_backend == "browser"
-                        else {}
-                    ),
+                    "eval_observation_mode": args.observation_mode,
+                    "eval_env_kwargs": dict(browser_env_kwargs),
                     "init_checkpoint_path": args.init_checkpoint,
                     "time_budget_sec": (
                         args.time_budget_sec

@@ -1,142 +1,211 @@
 # autoresearch
 
-This is an experiment to have the LLM do its own research on training a PPO agent to play the Chrome Dino game.
+This experiment asks the LLM to improve the **browser-image PPO** agent for
+Chrome Dino.
 
 ## Context
 
-The repo contains a **1:1 faithful Python simulation** of the Chromium T-Rex Runner (`dino_rl/env.py`), plus 10 educational RL algorithms and a production DQN. The current best agents:
+The repo now has two distinct PPO tracks:
 
-| Agent | Avg Score | Notes |
-|---|---|---|
-| DQN (Dueling Double) | 1,562 | 30-game eval, ~45 min training |
-| Heuristic (zero ML) | 780 | Forward simulation, 0 training |
-| PPO (current) | ~30 | Barely above random — needs work |
+| Track | Backend | Observation | Status |
+|---|---|---|---|
+| Feature PPO | Python simulator | 10 engineered features | Strong; already far ahead |
+| Image PPO | Real Chrome + ChromeDriver | 4 x 84 x 84 grayscale stack | Current research target |
 
-**The goal: train PPO to achieve eval avg >= 10,000.** This requires ~32,600 frames of perfect play at max speed 13.0.
+This file is about the **image PPO** track only.
+
+Current browser-image setup:
+
+- Environment backend: real `chrome://dino` through `dino_rl/browser_env.py`
+- Observation: 4 stacked grayscale frames of shape `(4, 84, 84)`
+- Preprocessing: crop to gameplay strip, mask score HUD, max-pool recent frames
+- Action repeat: `4`
+- Action space: `3` actions
+  - `0 = noop`
+  - `1 = jump`
+  - `2 = duck / hold down`
+- Reward:
+  - positive reward from scaled `distanceRan` progress
+  - `-1.0` on crash
+- Browser recovery:
+  - the env is expected to recover from dead sessions / tab crashes instead of
+    killing the trainer
+
+Current checkpoint baseline:
+
+- Best saved browser-image checkpoint:
+  `checkpoints/dino_ppo_browser_image_best.pth`
+- Best known eval from that line: `avg=75.7`, `min=57`, `max=99`
+- A longer continuation run was manually stopped after plateauing and did not
+  beat that checkpoint
+
+## Goal
+
+The current target for browser-image PPO is:
+
+- primary target: `eval avg >= 5,000`
+- intermediate milestone: `eval avg >= 1,000`
+
+This is a hard sample-efficiency problem. Do not assume image PPO will behave
+like the simulator feature agent.
 
 ## Setup
 
-To set up a new experiment, work with the user to:
+To start a new research pass, work with the user to:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `apr14`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: Read these for full context:
-   - `dino_rl/algorithms/ppo.py` — the file you modify. Network architecture, hyperparameters, PPO update, rollout collection, training loop.
-   - `dino_rl/common.py` — shared env wrapper (`DinoFeatureEnv`), evaluation, plotting, TensorBoard writer. Read-only reference.
-   - `dino_rl/env.py` — the game simulation. Read-only reference. Understand the physics, scoring (`round(distance * 0.025)`), and feature extraction (8-dim).
-4. **Confirm and go**: Confirm setup looks good.
-
-Once you get confirmation, kick off the experimentation.
+1. Propose a run tag based on the date, for example `apr20-image`
+2. Create a fresh branch `autoresearch/<tag>` from current `master`
+3. Read the in-scope files:
+   - `dino_rl/algorithms/ppo.py`
+   - `dino_rl/browser_env.py`
+   - `dino_rl/play_browser.py`
+   - `dino_rl/policy_loader.py`
+4. Confirm that Chrome/ChromeDriver browser control is functional
+5. Kick off the experiment loop
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training runs for a **fixed time budget of 30 minutes** (wall clock). You launch it as:
+Each experiment uses a single GPU and runs for a **fixed wall-clock budget of 1
+hour**.
 
-```
-CUDA_VISIBLE_DEVICES=1 python -m dino_rl.algorithms.train_all --algo ppo
-```
+Launch command from repo root:
 
-**What you CAN modify:**
-- `dino_rl/algorithms/ppo.py` — this is the primary file you edit. Everything is fair game: network architecture (width, depth, activation), hyperparameters (LR, clip_eps, GAE lambda, entropy coeff, rollout length, minibatch size, PPO epochs), training loop structure, reward shaping override, learning rate schedules, gradient clipping, observation normalization, etc.
-
-**What you CANNOT modify:**
-- `dino_rl/env.py` — the game simulation is fixed. It is the ground truth.
-- `dino_rl/common.py` — the evaluation harness and env wrapper are fixed.
-- Do not install new packages. Use only what's in `pyproject.toml`.
-
-**The goal is simple: get eval avg score >= 10,000.** The time budget is fixed at 30 minutes. Everything in `ppo.py` is fair game.
-
-**Key technical facts:**
-- Score 10k requires ~32,600 frames of survival. Rollout length must be >= 33,000 to experience the full game.
-- Speed ramps from 6.0 to 13.0 (max) over ~7,000 frames. At max speed, obstacles arrive every ~8-10 frames with tight gaps.
-- The agent needs 99.97%+ per-obstacle accuracy to reliably score 10k (one mistake = game over).
-- The 8-dim feature vector is: [obstacle1_dist, obstacle1_width, obstacle1_height, obstacle2_dist, dino_height, jump_velocity, speed, on_ground].
-- Action space: 2 actions (0=do nothing, 1=jump). Max entropy = ln(2) ≈ 0.693.
-- Reward: +0.01/step survival, -10.0 on crash (set in `common.py`).
-
-**The first run**: Your very first run should always be to establish the baseline with current settings, so you will run the training script as is.
-
-## Output format
-
-The training script prints periodic updates:
-
-```
-Update  10/5000 | Steps  400000 | Episodes  45 | AvgScore   123.4 | PolicyL -0.0123 | ValueL  2.345 | Entropy 0.5432 | KL 0.00345 | Clip 0.123
-  >> Eval @ update 50: avg=456.7  min=123  max=890
+```bash
+CUDA_VISIBLE_DEVICES=2 python -u -m dino_rl.algorithms.ppo \
+  --env-backend browser \
+  --observation-mode image \
+  --time-budget-sec 3600 \
+  --eval-every 5 \
+  --print-every 1 \
+  > run_browser_image.log 2>&1
 ```
 
-View training curves in TensorBoard:
+If a best browser-image checkpoint already exists, resume from it unless there
+is a good reason not to:
 
+```bash
+CUDA_VISIBLE_DEVICES=2 python -u -m dino_rl.algorithms.ppo \
+  --env-backend browser \
+  --observation-mode image \
+  --time-budget-sec 3600 \
+  --eval-every 5 \
+  --print-every 1 \
+  --init-checkpoint checkpoints/dino_ppo_browser_image_best.pth \
+  > run_browser_image.log 2>&1
 ```
+
+### What you CAN modify
+
+- `dino_rl/algorithms/ppo.py`
+- `dino_rl/browser_env.py`
+- `dino_rl/play_browser.py`
+- `dino_rl/policy_loader.py`
+
+Everything needed for image PPO is fair game: CNN architecture, PPO
+hyperparameters, rollout length, minibatch size, entropy coefficient, clipping,
+reward scaling, evaluation cadence, browser observation preprocessing, action
+repeat, recovery behavior, and checkpointing.
+
+### What you CANNOT modify
+
+- `dino_rl/env.py` for the purpose of making the browser-image task easier
+- install new packages
+- silently switch the experiment back to simulator features
+
+The task here is specifically to improve PPO on **browser images**.
+
+## Key Technical Facts
+
+- Action space is `3`, so max entropy is `ln(3) ~= 1.099`
+- Browser-image observations are expensive; update cadence is much slower than
+  simulator PPO
+- Current image defaults are tuned separately from feature PPO:
+  - `rollout_len = 512`
+  - `minibatch_size = 64`
+  - `eval_every = 5`
+  - `score_delta_coeff = 0.0`
+- The old future auxiliary loss is gone; this image path is now plain PPO with
+  a CNN encoder
+- Browser failures such as `tab crashed`, disconnected sessions, or dead
+  ChromeDriver connections should be treated as recoverable env failures, not as
+  acceptable reasons for the trainer to exit
+
+## Output Format
+
+The trainer prints periodic updates like:
+
+```text
+Update   40/100000 | Steps   20480 | Episodes   6 | AvgScore    54.3 | PolicyL  0.0012 | ValueL 121.337 | Entropy 0.9812 | KL 0.00234 | Clip 0.154
+  >> Eval @ update 40: avg=72.7  min=58  max=96
+```
+
+View TensorBoard with:
+
+```bash
 tensorboard --logdir results/runs
 ```
 
 Key metrics to watch:
-- `eval/avg_score` — the target metric. Must reach 10,000.
-- `train/avg_score` — training performance (noisy but should trend up).
-- `train/entropy` — policy randomness. Should decrease from ~0.69 as agent learns, but not collapse to 0.
-- `train/clip_fraction` — how often PPO clipping activates. Healthy: 0.05-0.2.
-- `train/approx_kl` — policy divergence per update. Healthy: < 0.05.
-- `train/value_loss` — critic accuracy. Should decrease over time.
-- `train/advantage_std` — signal quality. Should be > 0, not collapsing.
 
-## Logging results
+- `eval/avg_score` — target metric
+- `train/avg_score` — noisy, but should trend up over time
+- `train/entropy` — if it stays near `1.099`, the policy is close to random
+- `train/clip_fraction` — healthy range is usually around `0.05` to `0.25`
+- `train/approx_kl` — should stay controlled, usually `< 0.05`
+- `train/value_loss` — critic fit
+- browser recovery messages in the log — useful to track instability in Chrome
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated).
+## Logging Results
 
-The TSV has a header row and 5 columns:
+When an experiment finishes, log it to `results.tsv` as tab-separated text:
 
-```
+```text
 commit	eval_avg	eval_max	status	description
 ```
 
-1. git commit hash (short, 7 chars)
-2. eval_avg score achieved (e.g. 1234.5) — use 0.0 for crashes
-3. eval_max score achieved (e.g. 5678) — use 0 for crashes
+Columns:
+
+1. short git commit hash
+2. `eval_avg`
+3. `eval_max`
 4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+5. short description of the image/browser experiment
 
-Example:
+Do not commit `results.tsv`.
 
-```
-commit	eval_avg	eval_max	status	description
-a1b2c3d	32.9	65	keep	baseline (rollout=4096 128x128 net)
-b2c3d4e	456.7	1234	keep	rollout=40000 256x256x128 net
-c3d4e5f	0.0	0	crash	rollout=80000 OOM
-```
+## The Experiment Loop
 
-## The experiment loop
+Run on a dedicated branch such as `autoresearch/apr20-image`.
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/apr14`).
+Loop:
 
-LOOP FOREVER:
+1. Inspect the current branch and commit
+2. Make one focused image-PPO change
+3. Commit the change
+4. Run a 1-hour browser-image PPO experiment
+5. Read the results from the log
+6. If the run crashed:
+   - inspect the traceback
+   - distinguish between a browser-recovery bug, a trainer bug, and a bad idea
+7. Record the result in `results.tsv`
+8. If `eval_avg` improved, keep the commit and keep the new best checkpoint
+9. If `eval_avg` did not improve, revert the code change and continue from the
+   last good point
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `ppo.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `CUDA_VISIBLE_DEVICES=1 python -m dino_rl.algorithms.train_all --algo ppo > run.log 2>&1`
-5. Read out the results: `tail -5 run.log` and `grep "Eval\|TARGET\|TIME BUDGET" run.log | tail -10`
-6. If the grep output is empty or shows errors, the run crashed. Run `tail -n 50 run.log` to read the stack trace and attempt a fix.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If eval_avg improved (higher), you "advance" the branch, keeping the git commit
-9. If eval_avg is equal or worse, you git reset back to where you started
+### Timeout rule
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate.
+- Budget per experiment: `3600` seconds
+- If a run goes materially past `1 hour` without the trainer honoring the time
+  budget, stop it manually and treat that as a failure in the experiment loop
 
-**Timeout**: Each experiment should take ~30 minutes. If a run exceeds 40 minutes, kill it and treat it as a failure (discard and revert).
+### Crash rule
 
-**Crashes**: If a run crashes (OOM, or a bug), use your judgment: If it's something dumb and easy to fix (e.g. a typo), fix it and re-run. If the idea itself is fundamentally broken, log "crash", and move on.
+- A recoverable Chrome crash should not kill PPO
+- If PPO still exits on browser failure, fix that first before trusting any
+  learning result
 
-**Ideas to try** (in rough priority order):
-- Hyperparameter sweeps: LR, clip_eps, entropy_coeff, GAE lambda
-- Network architecture: deeper/wider, separate actor-critic networks, layer norm
-- Rollout length tuning: balance between seeing full game and update frequency
-- PPO epochs and minibatch size: more epochs = more sample reuse but risk overfitting
-- Observation normalization (running mean/std of features)
-- Reward shaping: different survival reward, speed-based bonus
-- Learning rate schedules: cosine, warmup + decay
-- Gradient norm clipping threshold
-- Orthogonal weight initialization
-- Value function clipping
+### Never confuse tracks
 
-**NEVER STOP**: Once the experiment loop has begun, do NOT pause to ask the human if you should continue. The human might be asleep or away and expects you to continue working *indefinitely* until manually stopped. You are autonomous. If you run out of ideas, think harder — re-read the code, try combining previous near-misses, try more radical changes. The loop runs until the human interrupts you, period.
+The feature agent and the image agent are different experiments with different
+budgets, observations, and expectations. Improvements on feature PPO do not
+count as progress for this browser-image program.

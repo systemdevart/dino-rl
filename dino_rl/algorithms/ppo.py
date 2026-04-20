@@ -213,7 +213,6 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
 
@@ -264,9 +263,6 @@ VALUE_COEFF = 0.5
 TARGET_EVAL_SCORE = 10000
 SCORE_DELTA_COEFF = 0.02
 LATENT_DIM = 128
-FUTURE_AUX_COEFF = 0.1
-FUTURE_REWARD_COEFF = 0.25
-FUTURE_DONE_COEFF = 0.25
 
 # Browser-backed PPO needs shorter rollouts because every environment step is
 # a Selenium round-trip instead of an in-process Python function call.
@@ -277,11 +273,12 @@ BROWSER_EVAL_EPISODES = 5
 BROWSER_EVAL_MAX_STEPS = 50000
 BROWSER_IMAGE_SIZE = 84
 BROWSER_IMAGE_STACK = 4
-BROWSER_IMAGE_ROLLOUT_LEN = 2048
+BROWSER_IMAGE_ACTION_REPEAT = 4
+BROWSER_IMAGE_ROLLOUT_LEN = 512
 BROWSER_IMAGE_PPO_EPOCHS = 4
-BROWSER_IMAGE_MINIBATCH_SIZE = 128
+BROWSER_IMAGE_MINIBATCH_SIZE = 64
 BROWSER_IMAGE_EVAL_EPISODES = 3
-BROWSER_IMAGE_EVAL_MAX_STEPS = 25000
+BROWSER_IMAGE_EVAL_MAX_STEPS = 6250
 
 
 def save_checkpoint(
@@ -333,7 +330,10 @@ def load_checkpoint(
     if load_optimizer and optimizer is not None:
         opt_state = checkpoint.get("optimizer_state_dict")
         if opt_state is not None:
-            optimizer.load_state_dict(opt_state)
+            try:
+                optimizer.load_state_dict(opt_state)
+            except ValueError as exc:
+                print(f"Skipping optimizer state from {path}: {exc}")
     return checkpoint
 
 
@@ -392,28 +392,9 @@ class ActorCritic(nn.Module):
         # Value head (critic): outputs a single scalar V(s).
         self.value_head = nn.Linear(latent_dim, 1)
 
-        # Auxiliary transition model: predict the next latent state, immediate
-        # reward, and termination flag from the current latent plus action.
-        self.future_head = nn.Sequential(
-            nn.Linear(latent_dim + action_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, latent_dim + 2),
-        )
-
     def encode(self, x: torch.Tensor):
         """Encode a state into a compact latent representation."""
         return self.backbone(x)
-
-    def predict_transition(self, states: torch.Tensor, actions: torch.Tensor):
-        """Predict next latent, reward, and done from current latent and action."""
-        latent = self.encode(states)
-        action_1h = F.one_hot(actions, num_classes=self.action_dim).float()
-        transition_in = torch.cat([latent, action_1h], dim=-1)
-        transition_out = self.future_head(transition_in)
-        pred_next_latent = transition_out[..., : self.latent_dim]
-        pred_reward = transition_out[..., self.latent_dim]
-        pred_done_logit = transition_out[..., self.latent_dim + 1]
-        return pred_next_latent, pred_reward, pred_done_logit
 
     def forward(self, x: torch.Tensor):
         """
@@ -504,11 +485,6 @@ class ImageActorCritic(nn.Module):
         )
         self.policy_head = nn.Linear(latent_dim, action_dim)
         self.value_head = nn.Linear(latent_dim, 1)
-        self.future_head = nn.Sequential(
-            nn.Linear(latent_dim + action_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, latent_dim + 2),
-        )
 
     def encode(self, x: torch.Tensor):
         if x.dim() == 3:
@@ -516,16 +492,6 @@ class ImageActorCritic(nn.Module):
         features = self.encoder_cnn(x)
         features = features.flatten(1)
         return self.encoder_head(features)
-
-    def predict_transition(self, states: torch.Tensor, actions: torch.Tensor):
-        latent = self.encode(states)
-        action_1h = F.one_hot(actions, num_classes=self.action_dim).float()
-        transition_in = torch.cat([latent, action_1h], dim=-1)
-        transition_out = self.future_head(transition_in)
-        pred_next_latent = transition_out[..., : self.latent_dim]
-        pred_reward = transition_out[..., self.latent_dim]
-        pred_done_logit = transition_out[..., self.latent_dim + 1]
-        return pred_next_latent, pred_reward, pred_done_logit
 
     def forward(self, x: torch.Tensor):
         features = self.encode(x)
@@ -701,7 +667,6 @@ def ppo_update(
     minibatch_size: int,
     entropy_coeff: float,
     value_coeff: float,
-    future_aux_coeff: float = 0.0,
 ):
     """
     Perform the PPO parameter update given a filled rollout buffer.
@@ -751,10 +716,6 @@ def ppo_update(
     total_policy_loss = 0.0
     total_value_loss = 0.0
     total_entropy = 0.0
-    total_future_loss = 0.0
-    total_future_latent_loss = 0.0
-    total_future_reward_loss = 0.0
-    total_future_done_loss = 0.0
     total_clip_frac = 0.0
     total_approx_kl = 0.0
     total_ratio_mean = 0.0
@@ -770,7 +731,6 @@ def ppo_update(
         for batch_idx in buffer.get_minibatches(minibatch_size):
             # ---- Gather minibatch data -----------------------------------
             mb_states = buffer.states[batch_idx]
-            mb_next_states = buffer.next_states[batch_idx]
             mb_actions = buffer.actions[batch_idx]
             mb_old_log_probs = buffer.log_probs[batch_idx]
             mb_advantages = advantages[batch_idx]
@@ -816,40 +776,8 @@ def ppo_update(
             # -entropy_coeff * mean(entropy) to encourage higher entropy).
             entropy_loss = -torch.mean(entropy)
 
-            future_latent_loss = torch.zeros((), device=mb_states.device)
-            future_reward_loss = torch.zeros((), device=mb_states.device)
-            future_done_loss = torch.zeros((), device=mb_states.device)
-            if future_aux_coeff > 0.0:
-                pred_next_latent, pred_reward, pred_done_logit = (
-                    model.predict_transition(mb_states, mb_actions)
-                )
-                with torch.no_grad():
-                    target_next_latent = model.encode(mb_next_states)
-                future_latent_loss = torch.mean(
-                    (pred_next_latent - target_next_latent) ** 2
-                )
-                future_reward_loss = torch.mean(
-                    (pred_reward - buffer.rewards[batch_idx]) ** 2
-                )
-                future_done_loss = F.binary_cross_entropy_with_logits(
-                    pred_done_logit,
-                    buffer.dones[batch_idx],
-                )
-                future_loss = (
-                    future_latent_loss
-                    + FUTURE_REWARD_COEFF * future_reward_loss
-                    + FUTURE_DONE_COEFF * future_done_loss
-                )
-            else:
-                future_loss = torch.zeros((), device=mb_states.device)
-
             # ---- Total loss and gradient step ----------------------------
-            loss = (
-                policy_loss
-                + value_coeff * value_loss
-                + entropy_coeff * entropy_loss
-                + future_aux_coeff * future_loss
-            )
+            loss = policy_loss + value_coeff * value_loss + entropy_coeff * entropy_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -876,10 +804,6 @@ def ppo_update(
             total_policy_loss += policy_loss.item()
             total_value_loss += value_loss.item()
             total_entropy += -entropy_loss.item()  # flip sign for readability
-            total_future_loss += future_loss.item()
-            total_future_latent_loss += future_latent_loss.item()
-            total_future_reward_loss += future_reward_loss.item()
-            total_future_done_loss += future_done_loss.item()
             total_clip_frac += clipped
             total_approx_kl += approx_kl
             total_ratio_mean += ratio.mean().item()
@@ -890,10 +814,6 @@ def ppo_update(
         "policy_loss": total_policy_loss / n,
         "value_loss": total_value_loss / n,
         "entropy": total_entropy / n,
-        "future_loss": total_future_loss / n,
-        "future_latent_loss": total_future_latent_loss / n,
-        "future_reward_loss": total_future_reward_loss / n,
-        "future_done_loss": total_future_done_loss / n,
         "clip_frac": total_clip_frac / n,
         "approx_kl": total_approx_kl / n,
         "ratio_mean": total_ratio_mean / n,
@@ -933,6 +853,7 @@ def make_env(
         page_url=env_kwargs.get("browser_url", "chrome://dino"),
         obs_size=env_kwargs.get("image_size", BROWSER_IMAGE_SIZE),
         frame_stack=env_kwargs.get("frame_stack", BROWSER_IMAGE_STACK),
+        action_repeat=env_kwargs.get("action_repeat", BROWSER_IMAGE_ACTION_REPEAT),
     )
 
 
@@ -967,7 +888,7 @@ def evaluate_policy(
     env_kwargs: dict | None = None,
 ):
     """Evaluate a policy on feature or image observations."""
-    if observation_mode == "feature":
+    if observation_mode == "feature" and env_backend != "browser":
         return evaluate(
             policy_fn,
             n_episodes=n_episodes,
@@ -976,26 +897,50 @@ def evaluate_policy(
             env_kwargs=env_kwargs,
         )
 
-    env = make_env(env_backend, observation_mode, env_kwargs)
-    scores = []
-    try:
-        for _ in range(n_episodes):
-            state = env.reset()
-            info = {"score": 0}
-            for _ in range(max_steps):
-                action = policy_fn(state)
-                state, _reward, done, info = env.step(action)
-                if done:
-                    break
-            scores.append(info["score"])
-        return {
-            "avg": float(np.mean(scores)),
-            "min": int(np.min(scores)),
-            "max": int(np.max(scores)),
-            "scores": scores,
-        }
-    finally:
-        env.close()
+    env_kwargs = dict(env_kwargs or {})
+    max_attempts = 3 if env_backend == "browser" else 1
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        env = None
+        try:
+            env = make_env(env_backend, observation_mode, env_kwargs)
+            scores = []
+            for _ in range(n_episodes):
+                state = env.reset()
+                info = {"score": 0}
+                for _ in range(max_steps):
+                    action = policy_fn(state)
+                    state, _reward, done, info = env.step(action)
+                    if done:
+                        break
+                scores.append(info["score"])
+            return {
+                "avg": float(np.mean(scores)),
+                "min": int(np.min(scores)),
+                "max": int(np.max(scores)),
+                "scores": scores,
+            }
+        except Exception as exc:
+            last_error = exc
+            if attempt == max_attempts:
+                raise
+            print(
+                f"  >> Eval environment startup failed "
+                f"(attempt {attempt}/{max_attempts}): "
+                f"{type(exc).__name__}: {exc}"
+            )
+            time.sleep(float(attempt))
+        finally:
+            if env is not None:
+                try:
+                    env.close()
+                except Exception:
+                    pass
+
+    raise RuntimeError(
+        "Evaluation failed without raising a concrete error."
+    ) from last_error
 
 
 # ---------------------------------------------------------------------------
@@ -1114,8 +1059,6 @@ def train(
     load_optimizer_state: bool = False,
     target_eval_score: int = TARGET_EVAL_SCORE,
     algo_name: str | None = None,
-    use_future_aux: bool | None = None,
-    future_aux_coeff: float = FUTURE_AUX_COEFF,
     lr: float = LR,
     clip_eps: float = CLIP_EPS,
     entropy_coeff: float = ENTROPY_COEFF,
@@ -1188,10 +1131,8 @@ def train(
         algo_name = "ppo" if env_backend == "sim" else f"ppo_{env_backend}"
         if observation_mode != "feature":
             algo_name = f"{algo_name}_{observation_mode}"
-    if use_future_aux is None:
-        use_future_aux = env_backend == "browser"
-    if not use_future_aux:
-        future_aux_coeff = 0.0
+    if observation_mode == "image" and score_delta_coeff == SCORE_DELTA_COEFF:
+        score_delta_coeff = 0.0
 
     best_ckpt_path, last_ckpt_path = get_ppo_checkpoint_paths(
         env_backend,
@@ -1207,7 +1148,6 @@ def train(
     print(f"       rollout_len={rollout_len}  minibatch={minibatch_size}")
     print(f"       entropy_coeff={entropy_coeff}  value_coeff={value_coeff}")
     print(f"       score_delta_coeff={score_delta_coeff}")
-    print(f"       future_aux={use_future_aux}  future_aux_coeff={future_aux_coeff}")
     print(
         f"       total steps = {n_updates} * {rollout_len} = {n_updates * rollout_len}"
     )
@@ -1285,7 +1225,6 @@ def train(
             minibatch_size=minibatch_size,
             entropy_coeff=entropy_coeff,
             value_coeff=value_coeff,
-            future_aux_coeff=future_aux_coeff,
         )
 
         # ---- 3. Anneal learning rate ---------------------------------
@@ -1324,16 +1263,6 @@ def train(
             writer.add_scalar("train/advantage_std", metrics["adv_std"], update)
             writer.add_scalar("train/grad_norm", metrics["grad_norm"], update)
             writer.add_scalar("train/learning_rate", cur_lr, update)
-            writer.add_scalar("train/future_loss", metrics["future_loss"], update)
-            writer.add_scalar(
-                "train/future_latent_loss", metrics["future_latent_loss"], update
-            )
-            writer.add_scalar(
-                "train/future_reward_loss", metrics["future_reward_loss"], update
-            )
-            writer.add_scalar(
-                "train/future_done_loss", metrics["future_done_loss"], update
-            )
             if episode_scores:
                 writer.add_scalar("train/max_score", max(episode_scores), update)
                 writer.add_scalar("train/min_score", min(episode_scores), update)
@@ -1347,14 +1276,23 @@ def train(
                 logits, _ = _model(s_t)
                 return logits.argmax().item()
 
-            eval_result = evaluate_policy(
-                policy_fn,
-                observation_mode=eval_observation_mode,
-                n_episodes=eval_episodes,
-                max_steps=eval_max_steps,
-                env_backend=eval_env_backend,
-                env_kwargs=eval_env_kwargs,
-            )
+            try:
+                eval_result = evaluate_policy(
+                    policy_fn,
+                    observation_mode=eval_observation_mode,
+                    n_episodes=eval_episodes,
+                    max_steps=eval_max_steps,
+                    env_backend=eval_env_backend,
+                    env_kwargs=eval_env_kwargs,
+                )
+            except Exception as exc:
+                if eval_env_backend != "browser":
+                    raise
+                print(
+                    f"  >> Eval skipped @ update {update}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
             eval_history.append((len(all_episode_scores), eval_result["avg"]))
             writer.add_scalar("eval/avg_score", eval_result["avg"], update)
             print(
@@ -1549,21 +1487,16 @@ if __name__ == "__main__":
         help="Number of grayscale frames to stack for image mode",
     )
     parser.add_argument(
+        "--action-repeat",
+        type=int,
+        default=BROWSER_IMAGE_ACTION_REPEAT,
+        help="Repeat each browser image action for this many frames",
+    )
+    parser.add_argument(
         "--target-eval-score",
         type=int,
         default=TARGET_EVAL_SCORE,
         help="Stop early once deterministic eval reaches this score",
-    )
-    parser.add_argument(
-        "--disable-future-aux",
-        action="store_true",
-        help="Disable the auxiliary future-state model",
-    )
-    parser.add_argument(
-        "--future-aux-coeff",
-        type=float,
-        default=FUTURE_AUX_COEFF,
-        help="Weight for the auxiliary future-state loss",
     )
     parser.add_argument(
         "--lr",
@@ -1611,6 +1544,7 @@ if __name__ == "__main__":
                 {
                     "image_size": args.image_size,
                     "frame_stack": args.frame_stack,
+                    "action_repeat": args.action_repeat,
                 }
             )
     if (args.eval_backend or args.env_backend) == "browser":
@@ -1620,6 +1554,7 @@ if __name__ == "__main__":
                 {
                     "image_size": args.image_size,
                     "frame_stack": args.frame_stack,
+                    "action_repeat": args.action_repeat,
                 }
             )
 
@@ -1642,8 +1577,6 @@ if __name__ == "__main__":
         init_checkpoint_path=args.init_checkpoint,
         load_optimizer_state=args.load_optimizer_state,
         target_eval_score=args.target_eval_score,
-        use_future_aux=not args.disable_future_aux,
-        future_aux_coeff=args.future_aux_coeff,
         lr=args.lr,
         clip_eps=args.clip_eps,
         entropy_coeff=args.entropy_coeff,

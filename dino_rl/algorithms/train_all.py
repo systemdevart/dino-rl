@@ -179,6 +179,12 @@ def main():
         help="PPO-only: browser image frame stack depth",
     )
     parser.add_argument(
+        "--action-repeat",
+        type=int,
+        default=4,
+        help="PPO-only: browser image action repeat",
+    )
+    parser.add_argument(
         "--init-checkpoint",
         default=None,
         help="PPO-only: initialize from an existing PPO checkpoint",
@@ -228,6 +234,7 @@ def main():
                             {
                                 "image_size": args.image_size,
                                 "frame_stack": args.frame_stack,
+                                "action_repeat": args.action_repeat,
                             }
                             if args.observation_mode == "image"
                             else {}

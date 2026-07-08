@@ -40,7 +40,11 @@ return (function() {{
             continue;
         }}
 
-        if (typeName === 'PTERODACTYL' &&
+        // NOTE: modern Chrome names the type 'pterodactyl' (camelCase), older
+        // builds used 'PTERODACTYL'. Compare case-insensitively, otherwise this
+        // filter never fires and the browser feeds the policy high birds the
+        // sim hides during training (out-of-distribution -> crash).
+        if (String(typeName).toUpperCase() === 'PTERODACTYL' &&
                 o.yPos + o.typeConfig.height <= groundY) {{
             continue;
         }}

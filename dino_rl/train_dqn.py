@@ -35,17 +35,24 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 
+# Opt-in obstacle-cleared reward: +this per obstacle passed. Makes the action
+# advantage LARGE (jump->clear vs noop->crash) instead of Q~=V (advantage ~0.01),
+# so the learned policy is robust enough to transfer to the browser. 0 = off.
+_CLEAR_BONUS = float(os.environ.get("DQN_CLEAR_REWARD", 0.0))
+
+
 class Agent:
     def __init__(self, action_size: int, continue_training: bool = False):
-        self.weight_backup = DQN_CHECKPOINT_PATH
+        self.weight_backup = os.environ.get("DQN_CKPT", DQN_CHECKPOINT_PATH)
         self.action_size = action_size
         self.memory = deque(maxlen=200000)
         self.epsilon = 1.0
         self.epsilon_min = 0.001
         self.gamma = 0.99
         self.epsilon_decay = 0.99
-        self.learning_rate = 0.0003
-        self.tau = 0.005  # Soft target update rate
+        # Env-var overrides (default = original behavior) for stability studies.
+        self.learning_rate = float(os.environ.get("DQN_LR", 0.0003))
+        self.tau = float(os.environ.get("DQN_TAU", 0.005))  # Soft target update rate
         self.train_freq = 4  # Train every 4 steps
         self.min_replay_size = 2000  # Min transitions before training starts
 
@@ -76,7 +83,7 @@ class Agent:
         for tp, p in zip(self.target_model.parameters(), self.model.parameters()):
             tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
 
-    def save_model(self):
+    def save_model(self, path: str | None = None):
         torch.save({
             'algo': 'dqn',
             'feature_dim': FEATURE_DIM,
@@ -85,7 +92,7 @@ class Agent:
             'target_model': self.target_model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'epsilon': self.epsilon,
-        }, self.weight_backup)
+        }, path or self.weight_backup)
 
     def act(self, state: np.ndarray, eval_mode: bool = False) -> int:
         if not eval_mode and np.random.rand() <= self.epsilon:
@@ -142,12 +149,18 @@ class TRexRunner:
     """Training loop for the DQN dino agent."""
 
     def __init__(self, continue_training: bool = False):
-        self.batch_size = 256
+        self.batch_size = int(os.environ.get("DQN_BATCH", 256))
         self.episodes = 1000000 # aka "until convergence" - we will stop early if we reach target score
         self.eval_freq = 25  # Run eval episode every N training episodes
-        self.eval_runs = 5   # Average over N eval episodes for reliability
-        # Training env: no DR (browser game always uses dino_x=50)
-        self.env = DinoRunEnv(domain_randomization=False, feature_noise=0.0,
+        self.eval_runs = int(os.environ.get("DQN_EVAL_RUNS", 5))  # avg over N eval eps
+        self.target_score = int(os.environ.get("DQN_TARGET", 20000))
+        # Robustness knobs (env vars) -- default OFF preserves old behavior.
+        # Training WITH domain randomization + feature noise produces a policy
+        # robust to the browser's ~2-8% feature differences (the sim DQN with
+        # noise=0 collapses at just 2% input noise -> why it doesn't transfer).
+        dr = os.environ.get("DQN_DR", "0") == "1"
+        noise = float(os.environ.get("DQN_NOISE", 0.0))
+        self.env = DinoRunEnv(domain_randomization=dr, feature_noise=noise,
                               skip_clear_time=True)
         # Eval env uses no randomization for consistent benchmarking
         self.eval_env = DinoRunEnv(domain_randomization=False, feature_noise=0.0,
@@ -186,6 +199,7 @@ class TRexRunner:
         try:
             for e in range(self.episodes):
                 self.env.reset()
+                _cleared_seen = set()
                 state = self.env.get_features()
 
                 game_score = 0
@@ -199,10 +213,18 @@ class TRexRunner:
                     # Reward shaping (matching actor-critic's proven config):
                     # +0.01 per step keeps discounted survival reward small,
                     # -10.0 crash penalty dominates for short (bad) episodes.
+                    # DQN_CRASH_PENALTY env override for stability studies (a -10
+                    # penalty vs +0.01/step creates large TD spikes).
                     if done:
-                        reward = -10.0
+                        reward = float(os.environ.get("DQN_CRASH_PENALTY", -10.0))
                     else:
                         reward = 0.01
+                        if _CLEAR_BONUS:
+                            for _o in self.env.obstacles:
+                                if (_o.x + _o.width <= self.env.dino_x
+                                        and id(_o) not in _cleared_seen):
+                                    _cleared_seen.add(id(_o))
+                                    reward += _CLEAR_BONUS
 
                     next_state = self.env.get_features()
 
@@ -247,21 +269,24 @@ class TRexRunner:
                     )
                     if eval_score > best_eval:
                         best_eval = eval_score
-                        self.agent.save_model()
+                        self.agent.save_model()  # BEST -> weight_backup (never overwritten below)
                         print(f"  ** New best eval! Saved model.")
 
-                    if best_eval >= 20000:
+                    if best_eval >= self.target_score:
                         print(f"\n*** TARGET REACHED! Eval avg: {best_eval} ***")
                         break
 
+                # Periodic/crash-recovery save goes to a SEPARATE '.last' file so it
+                # never clobbers the best-eval checkpoint (previously it did, which
+                # silently destroyed the good policy once training degraded).
                 if (e + 1) % 100 == 0:
-                    self.agent.save_model()
+                    self.agent.save_model(self.agent.weight_backup + ".last")
 
         except KeyboardInterrupt:
             print("\nTraining interrupted by user.")
         finally:
             print(f"\nFinal save... Best train: {best_score}, Best eval: {best_eval}")
-            self.agent.save_model()
+            self.agent.save_model(self.agent.weight_backup + ".last")
 
 
 def main():

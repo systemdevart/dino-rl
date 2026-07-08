@@ -239,6 +239,142 @@ class ChromeDinoGame:
             ActionChains(self.driver).key_up(Keys.ARROW_DOWN).perform()
         self._duck_pressed = pressed
 
+    def enable_deterministic(self):
+        """Pause the game and install a controlled frame-stepper.
+
+        The Chrome game normally runs in real time, so the ~tens of ms we spend
+        on screenshot + round-trips + model inference let the game advance past
+        the observed frame -- the action lands late and the observation/action
+        desync. That makes the browser a much harder (and non-reproducible)
+        environment than the discrete simulator, and breaks transfer of
+        sim-trained policies.
+
+        Here we stop() the game (which cancels its requestAnimationFrame loop and
+        freezes distanceRan), suppress the auto-reschedule, and expose
+        window.__envStep(action, n): it applies the action, then advances EXACTLY
+        n game frames by driving Runner.update() with a fixed per-frame delta, and
+        returns the state. Between calls the game is frozen, so our screenshot and
+        inference cause zero drift -- a clean discrete step, like the sim.
+        """
+        self.driver.execute_script(
+            """
+            var r = Runner.instance_;
+            r.stop();
+            if (!r._detOrigSched) { r._detOrigSched = r.scheduleNextUpdate; }
+            r.scheduleNextUpdate = function(){};   // suppress rAF re-arm
+            // Virtual clock: the game reads time via performance.now() inside
+            // getTimeStamp(); under real time the delta between our setting
+            // r.time and update() reading now jitters (esp. under parallel CPU
+            // load), so deltaTime != msPerFrame and the physics drift. Override
+            // performance.now() to a controlled clock that advances EXACTLY one
+            // frame per step -> deltaTime == msPerFrame exactly, fully
+            // deterministic and parallel-safe (precise jump timing).
+            if (typeof r._vclock !== 'number') { r._vclock = 1e6; }
+            if (!performance._detPatched) {
+                performance.now = function() { return Runner.instance_._vclock; };
+                var _origDateNow = Date.now;
+                Date.now = function() { return Runner.instance_._vclock; };
+                performance._detPatched = true;
+            }
+            r.time = r._vclock;
+            window.__getState = function() { %s };
+            window.__envStep = function(action, n) {
+                var r = Runner.instance_;
+                var t = r.tRex;
+                // Apply the action with EXACTLY the sim's (and the real key
+                // handler's) semantics. The old code called setDuck(action===2)
+                // unconditionally, which put the trex into DUCKING status
+                // MID-AIR -- a (jumping=1, ducking=1) state that never exists in
+                // the sim (it routes down-while-airborne to speed-drop), so
+                // sim-trained policies went out-of-distribution and died.
+                if (action === 1) {
+                    if (!t.jumping) {
+                        if (t.ducking && t.setDuck) { t.setDuck(false); }
+                        t.startJump(r.currentSpeed);
+                    }
+                } else if (action === 2) {
+                    if (t.jumping) {
+                        t.speedDrop = true;              // sim: speed_drop, not duck
+                    } else if (t.setDuck && !t.ducking) {
+                        t.setDuck(true);
+                    }
+                } else {
+                    if (!t.jumping && t.ducking && t.setDuck) { t.setDuck(false); }
+                }
+                r.playing = true;
+                for (var i = 0; i < n; i++) {
+                    r._vclock += r.msPerFrame;   // advance exactly one frame
+                    r.update();                  // deltaTime == msPerFrame
+                }
+                return window.__getState();
+            };
+            return true;
+            """ % self.state_js
+        )
+        self._deterministic = True
+
+    def env_step(self, action: int, n_frames: int) -> dict | None:
+        """One deterministic step: apply action, advance n_frames, return state."""
+        try:
+            return self.driver.execute_script(
+                "return window.__envStep(arguments[0], arguments[1]);",
+                int(action), int(n_frames),
+            )
+        except JavascriptException:
+            return None
+
+    def disable_deterministic(self):
+        """Restore the normal real-time loop (needed before restart()/quit)."""
+        try:
+            self.driver.execute_script(
+                """
+                var r = Runner.instance_;
+                if (r && r._detOrigSched) { r.scheduleNextUpdate = r._detOrigSched; }
+                """
+            )
+        except JavascriptException:
+            pass
+        self._deterministic = False
+
+    def restart_deterministic(self):
+        """JS-only restart for deterministic mode, with a reload fallback.
+
+        The normal restart() wraps the JS in ActionChains set_duck +
+        set_acceleration, which misbehave while paused. This restores the normal
+        update loop and restarts in a single JS call, then re-installs the
+        frame-stepper. Runner.restart() occasionally throws an internal assertion
+        for certain crash/obstacle states, so on failure we reload the page and
+        start fresh (slower, but bulletproof).
+        """
+        try:
+            self.driver.execute_script(
+                """
+                var r = Runner.instance_ = Runner.getInstance();
+                if (r._detOrigSched) { r.scheduleNextUpdate = r._detOrigSched; }
+                r.restart();
+                """
+            )
+            self._duck_pressed = False
+            self.set_acceleration(self.accelerate)
+            self.enable_deterministic()
+            return
+        except JavascriptException:
+            pass
+        # Fallback: reload chrome://dino and start a fresh game.
+        try:
+            self.driver.get(self.page_url)
+        except WebDriverException:
+            pass
+        time.sleep(0.4)
+        self._body = self.driver.find_element("tag name", "body")
+        self._ensure_runner_instance()
+        self._duck_pressed = False
+        self.driver.execute_script(
+            "Runner.instance_.playIntro(); Runner.instance_.startGame();"
+        )
+        self.set_acceleration(self.accelerate)
+        self.enable_deterministic()
+
     def get_state(self) -> dict | None:
         try:
             # state_js self-aliases Runner.instance_, so no separate

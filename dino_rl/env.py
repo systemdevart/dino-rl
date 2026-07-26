@@ -360,7 +360,11 @@ class DinoRunEnv:
             self.reached_min_height = False
         elif duck_requested:
             if self.jumping:
+                # Trex.setSpeedDrop() resets the vertical velocity as well as
+                # setting the flag. Without this, the speed-drop multiplier can
+                # propel an ascending dino farther upward for one frame.
                 self.speed_drop = True
+                self.jump_velocity = 1.0
                 self.ducking = False
             else:
                 self.ducking = True

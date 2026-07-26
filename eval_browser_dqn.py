@@ -19,21 +19,27 @@ from concurrent.futures import ThreadPoolExecutor
 from dino_rl.browser_env import ChromeDinoGame
 from dino_rl.feature_contract import FEATURE_DIM
 from dino_rl.networks import DuelingDQN
+from dino_rl.train_dqn import greedy_feature_actions
 
 CKPT = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/dino_runner_feat_a.pth"
 EPISODES = int(sys.argv[2]) if len(sys.argv) > 2 else 8
 STEP_CAP = int(sys.argv[3]) if len(sys.argv) > 3 else 22000
 
 model = DuelingDQN(FEATURE_DIM, 3)
-ck = torch.load(CKPT, map_location="cpu", weights_only=False)
+ck = torch.load(CKPT, map_location="cpu", weights_only=True)
 model.load_state_dict(ck["model"] if isinstance(ck, dict) and "model" in ck else ck)
 model.eval()
+NO_DUCK = bool(ck.get("no_duck", False)) if isinstance(ck, dict) else False
 
 
 @torch.no_grad()
 def act(features) -> int:
-    x = torch.tensor(np.array([features]), dtype=torch.float32)
-    return int(model(x).argmax(1).item())
+    states = torch.tensor(np.array([features]), dtype=torch.float32)
+    q_values = model(states)
+    return int(greedy_feature_actions(
+        q_values,
+        no_duck=NO_DUCK,
+    ).item())
 
 
 def episode(_i) -> int:

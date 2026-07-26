@@ -1,0 +1,2 @@
+>>> VERIFY checkpoints/dino_dqn_image_scratchfixw_candidate.pth n=8 cap=22000: mean=6500 min=6500 max=6500 >=5000: 8/8 cap-survivals=8
+scores: [6500, 6500, 6500, 6500, 6500, 6500, 6500, 6500]

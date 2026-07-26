@@ -294,7 +294,17 @@ class ChromeDinoGame:
                     }
                 } else if (action === 2) {
                     if (t.jumping) {
-                        t.speedDrop = true;              // sim: speed_drop, not duck
+                        // Match Chrome's ArrowDown key path exactly. Merely
+                        // setting speedDrop is not enough: setSpeedDrop() also
+                        // resets jumpVelocity to 1 so the first drop frame moves
+                        // downward instead of multiplying the current upward
+                        // velocity by the speed-drop coefficient.
+                        if (t.setSpeedDrop) {
+                            t.setSpeedDrop();
+                        } else {
+                            t.speedDrop = true;
+                            t.jumpVelocity = 1;
+                        }
                     } else if (t.setDuck && !t.ducking) {
                         t.setDuck(true);
                     }
@@ -581,12 +591,21 @@ class ChromeDinoImageEnv:
         frame_timeout_sec: float = 0.25,
         poll_interval_sec: float = 0.002,
         obs_size: int = 84,
+        obs_width: int | None = None,
         frame_stack: int = 4,
         action_repeat: int = 4,
         crop_top_ratio: float = 0.15,
         crop_bottom_ratio: float = 0.98,
         score_mask_left_ratio: float = 0.82,
         score_mask_height_ratio: float = 0.28,
+        mask_score: bool = True,
+        reward_mode: str = "distance",
+        survival_reward: float = 0.01,
+        deterministic: bool = False,
+        frames_per_action: int = 2,
+        start_speed_prob: float = 0.0,
+        start_speed_min: float = 8.0,
+        start_speed_max: float = 13.0,
     ):
         self.game = ChromeDinoGame(
             page_url=page_url,
@@ -596,15 +615,49 @@ class ChromeDinoImageEnv:
         self.action_space = ActionSpace(3)
         self.frame_timeout_sec = frame_timeout_sec
         self.poll_interval_sec = poll_interval_sec
+        # Deterministic mode: pause the game and advance exactly frames_per_action
+        # game frames per env step, so screenshot+inference cause no real-time
+        # drift. Makes the browser a clean discrete stepper (like the sim) and
+        # removes the wait-for-real-time bottleneck.
+        self.deterministic = deterministic
+        self.frames_per_action = frames_per_action
+        # Speed-start curriculum (training-data distribution fix, not a policy
+        # prior): with probability start_speed_prob a reset episode begins at a
+        # random currentSpeed in [start_speed_min, start_speed_max] instead of 6.
+        # Rationale: speed maxes at 13 by score ~2100, and reaching one max-speed
+        # sample normally costs 7000+ frames of low-speed play, so the replay
+        # buffer starves of exactly the regime where trained agents die. Eval
+        # environments keep the default 0.0 (normal starts).
+        self.start_speed_prob = start_speed_prob
+        self.start_speed_min = start_speed_min
+        self.start_speed_max = start_speed_max
+        # The Dino canvas is ~552x150 (~3.7:1). obs_size is the observation
+        # HEIGHT; obs_width defaults to a wider value that roughly preserves the
+        # canvas aspect ratio so obstacles keep their horizontal resolution.
+        # (A square 84x84 squished the canvas ~6.6x horizontally, collapsing
+        # obstacles to 1-2px smudges -- the main reason a single frame could not
+        # represent game state.)
         self.obs_size = obs_size
+        self.obs_h = obs_size
+        self.obs_w = obs_width if obs_width is not None else obs_size
         self.frame_stack = frame_stack
         self.action_repeat = action_repeat
+        # reward_mode "distance": scaled distanceRan delta (unbounded, grows with
+        # game speed). "survival": bounded +survival_reward per frame stayed
+        # alive (like the feature env), which keeps returns well-scaled and is
+        # the generalizable choice. Both apply gameover_penalty on crash.
+        self.reward_mode = reward_mode
+        self.survival_reward = survival_reward
         self.distance_reward_scale = 0.02
         self.gameover_penalty = -1.0
         self.crop_top_ratio = crop_top_ratio
         self.crop_bottom_ratio = crop_bottom_ratio
         self.score_mask_left_ratio = score_mask_left_ratio
         self.score_mask_height_ratio = score_mask_height_ratio
+        # Preserve the historical PPO observation contract by default. The
+        # wide DQN path opts out explicitly because its top crop already removes
+        # the HUD and the mask can hide high pterodactyls entering from the right.
+        self.mask_score = mask_score
         self._started = False
         self._last_distance_ran = 0.0
         self._last_state: dict | None = None
@@ -613,7 +666,7 @@ class ChromeDinoImageEnv:
     def _cached_obs(self) -> np.ndarray:
         if not self._frames:
             return np.zeros(
-                (self.frame_stack, self.obs_size, self.obs_size),
+                (self.frame_stack, self.obs_h, self.obs_w),
                 dtype=np.float32,
             )
         frames = [frame.copy() for frame in self._frames]
@@ -671,31 +724,44 @@ class ChromeDinoImageEnv:
         return np.stack(list(self._frames), axis=0).astype(np.float32)
 
     def _preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
-        """Crop to the gameplay strip and suppress the score HUD."""
+        """Crop to the gameplay strip and resize, preserving aspect ratio."""
         height, width = frame.shape
         top = min(max(int(height * self.crop_top_ratio), 0), height - 1)
         bottom = min(max(int(height * self.crop_bottom_ratio), top + 1), height)
-        cropped = frame[top:bottom].copy()
+        cropped = frame[top:bottom]
 
-        mask_x = min(
-            max(int(cropped.shape[1] * self.score_mask_left_ratio), 0),
-            cropped.shape[1],
-        )
-        mask_h = min(
-            max(int(cropped.shape[0] * self.score_mask_height_ratio), 1),
-            cropped.shape[0],
-        )
-        cropped[:mask_h, mask_x:] = 0
+        if self.mask_score:
+            cropped = cropped.copy()
+            mask_x = min(
+                max(int(cropped.shape[1] * self.score_mask_left_ratio), 0),
+                cropped.shape[1],
+            )
+            mask_h = min(
+                max(int(cropped.shape[0] * self.score_mask_height_ratio), 1),
+                cropped.shape[0],
+            )
+            cropped[:mask_h, mask_x:] = 0
 
+        # cv2.resize takes (width, height); obs_w >> obs_h keeps the wide
+        # gameplay strip's horizontal detail instead of squishing to a square.
         resized = cv2.resize(
             cropped,
-            (self.obs_size, self.obs_size),
+            (self.obs_w, self.obs_h),
             interpolation=cv2.INTER_AREA,
         )
         return resized.astype(np.float32) / 255.0
 
     def _capture_frame(self) -> np.ndarray:
         return self._preprocess_frame(self.game.get_frame(obs_size=None))
+
+    def _pre_action_features(self) -> list | None:
+        """Copy the browser features paired with the next image-policy action."""
+        if self._last_state is None:
+            return None
+        features = self._last_state.get("features")
+        if features is None:
+            return None
+        return list(features)
 
     @staticmethod
     def _pool_recent_frames(frames: list[np.ndarray]) -> np.ndarray:
@@ -708,10 +774,30 @@ class ChromeDinoImageEnv:
             if not self._started:
                 self.game.start()
                 self._started = True
+                if self.deterministic:
+                    self.game.enable_deterministic()
+            elif self.deterministic:
+                # JS-only restart that restores the loop, restarts, and
+                # re-installs the frame-stepper (avoids the ActionChains wrapper
+                # that breaks while paused).
+                self.game.restart_deterministic()
             else:
                 self.game.restart()
 
-            state = self._wait_for_state(require_playing=True)
+            if self.deterministic:
+                if (self.start_speed_prob > 0.0
+                        and np.random.rand() < self.start_speed_prob):
+                    spd = float(np.random.uniform(self.start_speed_min,
+                                                  self.start_speed_max))
+                    self.game.driver.execute_script(
+                        "Runner.instance_.currentSpeed = arguments[0];", spd)
+                # Advance one action's worth of frames to reach a playing state
+                # deterministically.
+                state = self.game.env_step(0, self.frames_per_action)
+                if state is None:
+                    state = self.game.get_state()
+            else:
+                state = self._wait_for_state(require_playing=True)
             self._last_state = state
             self._last_distance_ran = float(state.get("distanceRan", 0.0))
             frame = self._capture_frame()
@@ -725,13 +811,71 @@ class ChromeDinoImageEnv:
             self._recover_browser_session(exc, context="image reset")
             return self.reset(_allow_recover=False)
 
+    def _step_deterministic(self, action: int):
+        """Discrete step: apply action, advance frames_per_action frames, capture."""
+        fallback_obs = self._cached_obs()
+        score = int(self._last_state.get("score", 0)) if self._last_state else 0
+        pre_action_features = self._pre_action_features()
+        prev_obstacle_dist = None
+        if self._last_state and self._last_state.get("features"):
+            prev_obstacle_dist = float(self._last_state["features"][0])
+        try:
+            state = self.game.env_step(action, self.frames_per_action)
+            if state is None:
+                state = self.game.get_state()
+            self._last_state = state
+            prev_distance = self._last_distance_ran
+            current_distance = float(state.get("distanceRan", prev_distance))
+            distance_delta = max(current_distance - prev_distance, 0.0)
+            self._last_distance_ran = current_distance
+            score = int(state["score"])
+            done = bool(state["crashed"])
+            features = state.get("features") or []
+            obstacle_cleared = bool(
+                not done and prev_obstacle_dist is not None and features
+                and float(features[0]) - prev_obstacle_dist > 0.25
+            )
+
+            self._frames.append(self._capture_frame())
+
+            if self.reward_mode == "survival":
+                reward = 0.0 if done else self.survival_reward
+            else:
+                reward = self.distance_reward_scale * distance_delta
+            if done:
+                reward += self.gameover_penalty
+            return (
+                self._stacked_obs(), reward, done,
+                {
+                    "score": score,
+                    "obstacle_cleared": obstacle_cleared,
+                    "pre_action_features": pre_action_features,
+                },
+            )
+        except Exception as exc:
+            self._recover_browser_session(exc, context=f"det step(action={action})")
+            return (
+                fallback_obs,
+                self.gameover_penalty,
+                True,
+                {
+                    "score": score,
+                    "browser_recovered": True,
+                    "pre_action_features": pre_action_features,
+                },
+            )
+
     def step(self, action: int):
         assert action in self.action_space
+        if self.deterministic:
+            return self._step_deterministic(action)
         fallback_obs = self._cached_obs()
         total_reward = 0.0
         recent_frames: list[np.ndarray] = []
         score = int(self._last_state.get("score", 0)) if self._last_state else 0
+        pre_action_features = self._pre_action_features()
         done = False
+        obstacle_cleared = False
 
         try:
             for repeat_idx in range(self.action_repeat):
@@ -739,6 +883,9 @@ class ChromeDinoImageEnv:
                 if action == 1 and repeat_idx == 0:
                     self.game.jump()
 
+                prev_obstacle_dist = None
+                if self._last_state and self._last_state.get("features"):
+                    prev_obstacle_dist = float(self._last_state["features"][0])
                 prev_distance = self._last_distance_ran
                 state = self._wait_for_state(
                     require_playing=False,
@@ -750,9 +897,19 @@ class ChromeDinoImageEnv:
                 self._last_distance_ran = current_distance
                 score = int(state["score"])
                 recent_frames.append(self._capture_frame())
-                total_reward += self.distance_reward_scale * distance_delta
+                features = state.get("features") or []
+                if (prev_obstacle_dist is not None and features
+                        and float(features[0]) - prev_obstacle_dist > 0.25):
+                    obstacle_cleared = True
 
                 done = bool(state["crashed"])
+                if self.reward_mode == "survival":
+                    # Bounded: credit each frame the agent stayed alive.
+                    if not done:
+                        total_reward += self.survival_reward
+                else:
+                    total_reward += self.distance_reward_scale * distance_delta
+
                 if done:
                     total_reward += self.gameover_penalty
                     break
@@ -765,7 +922,11 @@ class ChromeDinoImageEnv:
                 self._stacked_obs(),
                 total_reward,
                 done,
-                {"score": score},
+                {
+                    "score": score,
+                    "obstacle_cleared": obstacle_cleared,
+                    "pre_action_features": pre_action_features,
+                },
             )
         except Exception as exc:
             self._recover_browser_session(
@@ -776,7 +937,11 @@ class ChromeDinoImageEnv:
                 fallback_obs,
                 self.gameover_penalty,
                 True,
-                {"score": score, "browser_recovered": True},
+                {
+                    "score": score,
+                    "browser_recovered": True,
+                    "pre_action_features": pre_action_features,
+                },
             )
 
     def get_score(self) -> int:
@@ -830,8 +995,8 @@ class VecChromeDinoImageEnv:
         self.action_space = self.envs[0].action_space
         self.obs_shape = (
             self.envs[0].frame_stack,
-            self.envs[0].obs_size,
-            self.envs[0].obs_size,
+            self.envs[0].obs_h,
+            self.envs[0].obs_w,
         )
 
     def reset(self) -> np.ndarray:
@@ -868,6 +1033,21 @@ class VecChromeDinoImageEnv:
     def get_scores(self) -> np.ndarray:
         """Current per-worker score (cached, no browser round-trip)."""
         return np.array([env.get_score() for env in self.envs], dtype=np.int64)
+
+    def get_feature_states(self) -> list:
+        """Per-worker engineered feature vector (or None), for scripted policies.
+
+        Used to drive a heuristic/expert policy (which reads the true game state)
+        while still collecting the matching image observations -- e.g. to gather
+        behavior-cloning demonstrations.
+        """
+        def _features(env):
+            st = env._last_state
+            if st is None:
+                return None
+            return list(st.get("features", []))
+
+        return list(self._pool.map(_features, self.envs))
 
     def close(self):
         for env in self.envs:
